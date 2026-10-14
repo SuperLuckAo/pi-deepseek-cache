@@ -218,9 +218,40 @@ describe("P3: session_before_compact", () => {
   });
 
   it("鉴权失败时回退", async () => {
-    mockCtx.modelRegistry.getApiKeyAndHeaders.mockResolvedValueOnce({ ok: false, apiKey: undefined, headers: {} });
+    mockCtx.modelRegistry.getApiKeyAndHeaders.mockResolvedValueOnce({ ok: false, error: "no credential" });
     const listener = (api.on as any).mock.calls.find(([e]: [string]) => e === "session_before_compact")?.[1];
     expect(await listener({ preparation: { messagesToSummarize: [], firstKeptEntryId: "e1", tokensBefore: 500, previousSummary: "" }, signal: new AbortController().signal }, mockCtx)).toBeUndefined();
+  });
+
+  // 回归：官方 ResolvedRequestAuth 允许 ok:true 而 apiKey 为 undefined（纯 headers/OAuth 类 provider）。
+  // 旧实现用 `!auth.ok || !auth.apiKey` 判定，会把这类 provider 误判为鉴权失败并静默放弃自定义压缩。
+  it("apiKey 为空但 auth.ok（纯 headers/OAuth）时仍继续摘要", async () => {
+    mockCtx.modelRegistry.getApiKeyAndHeaders.mockResolvedValueOnce({ ok: true, apiKey: undefined, headers: { "x-api-key": "h" } });
+    completeMock.mockResolvedValueOnce({ content: [{ type: "text", text: "summary via headers" }] } as any);
+    const listener = (api.on as any).mock.calls.find(([e]: [string]) => e === "session_before_compact")?.[1];
+    const r = await listener({ preparation: { messagesToSummarize: [{ role: "user", content: "hi" }], firstKeptEntryId: "e1", tokensBefore: 100, previousSummary: "" }, signal: new AbortController().signal }, mockCtx);
+    expect(r.compaction.summary).toBe("summary via headers");
+  });
+
+  // 回归：截断的摘要不得成为检查点（pi 自身同样拒绝，见 getSummarizationFailure）。
+  // 否则不完整的摘要会替换历史，并按输入哈希被 summary-cache.json 固化。
+  it("stopReason=length（截断）时回退，不采纳不完整摘要", async () => {
+    completeMock.mockResolvedValueOnce({ content: [{ type: "text", text: "partial summ" }], stopReason: "length" } as any);
+    const listener = (api.on as any).mock.calls.find(([e]: [string]) => e === "session_before_compact")?.[1];
+    expect(await listener({ preparation: { messagesToSummarize: [{ role: "user", content: "x" }], firstKeptEntryId: "e1", tokensBefore: 500, previousSummary: "" }, signal: new AbortController().signal }, mockCtx)).toBeUndefined();
+  });
+
+  it("stopReason=error 时回退", async () => {
+    completeMock.mockResolvedValueOnce({ content: [{ type: "text", text: "partial" }], stopReason: "error", errorMessage: "boom" } as any);
+    const listener = (api.on as any).mock.calls.find(([e]: [string]) => e === "session_before_compact")?.[1];
+    expect(await listener({ preparation: { messagesToSummarize: [{ role: "user", content: "x" }], firstKeptEntryId: "e1", tokensBefore: 500, previousSummary: "" }, signal: new AbortController().signal }, mockCtx)).toBeUndefined();
+  });
+
+  it("stopReason=stop（正常结束）时采纳摘要", async () => {
+    completeMock.mockResolvedValueOnce({ content: [{ type: "text", text: "complete summary" }], stopReason: "stop" } as any);
+    const listener = (api.on as any).mock.calls.find(([e]: [string]) => e === "session_before_compact")?.[1];
+    const r = await listener({ preparation: { messagesToSummarize: [{ role: "user", content: "x" }], firstKeptEntryId: "e1", tokensBefore: 500, previousSummary: "" }, signal: new AbortController().signal }, mockCtx);
+    expect(r.compaction.summary).toBe("complete summary");
   });
 
   it("complete 调用失败时回退", async () => {

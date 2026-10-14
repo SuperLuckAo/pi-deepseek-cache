@@ -1,6 +1,6 @@
 {
   "name": "pi-deepseek-cache",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DeepSeek prefix-cache extension for pi — hit-rate telemetry, prefix guard, and cache-friendly compaction.",
   "type": "module",
   "main": "./index.ts",
@@ -38,6 +38,9 @@
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "^1.2.0",
+    "@earendil-works/pi-coding-agent": "^1.2.0",
+    "@earendil-works/pi-tui": "^1.2.0",
     "@eslint/js": "^10.0.1",
     "eslint": "^10.8.1",
     "prettier": "^3.9.6",

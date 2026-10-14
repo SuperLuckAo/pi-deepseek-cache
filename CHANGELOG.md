@@ -38,14 +38,17 @@
 - **鉴权预检会误判纯 headers/OAuth 类 provider**：官方 `ResolvedRequestAuth` 允许 `ok: true` 而 `apiKey` 为 `undefined`（走 header 鉴权）。旧判定 `!auth.ok || !auth.apiKey` 会把这类 provider 当成鉴权失败，静默放弃自定摘要。现只看 `!auth.ok`。
 - 上述两项修正均由独立代码审查子代理提出，并已补充回归用例：把 `index.ts` 回滚到修正前，这 3 个用例确实失败（`3 failed | 58 passed`），修正后 61/61 通过。
 
+### 修复：CI（lint 自 v0.2.0 起一直红灯）
+
+- **背景**：查 `.github/workflows/ci.yml` 的全部历史运行，v0.2.0、v0.2.1、v0.3.0 三次 main 推送**全部**在 `test -> Lint` 步骤失败（另有最早一次失败在 `setup-node`）。因为 `npm run lint` = `eslint . && prettier --check .` 先失败，`tsc` 与 `vitest` 长期以来实际上没有把关——这正是本版本上述问题（既有类型错误、宿主 API 失配、v4-pro 计价、摘要截断）能潜伏至今的直接原因。
+- **eslint**：`index.ts` 里 2 个**既有**错误已修（`no-useless-assignment` 的死初始化；`no-empty` 的空 catch 改为写明为何可以吞掉）；`tests/**` 下 30 余个 `no-explicit-any` / `no-unsafe-function-type` 通过在 eslint 配置里**仅对测试目录**关闭这两条规则解决——测试替身刻意宽松，断言目标是行为而非形状，源码 `index.ts` 保持严格。修复后 `eslint .` 报告 **0 errors**（保留 4 个 warning，少于 main）。
+- **prettier**：11 个已纳入版本管理的文件从未被格式化过（含 `index.ts` 与全部文档），已整体执行一次 `prettier --write .`，**单独一个 commit**（无行为变化）以免混淆真实改动。
+- 格式化会移动 `index.ts` 行号，因此文档中 17 处 `index.ts:NNN` 引用已单次映射重算并逐条核对（顺序替换会串联错位——738 由 `context` 处理器变成了 `before_provider_request`）。
+
 ### 其它
 
 - `devDependencies` 的 pi 包从 `^0.84.2` 升到 `^1.2.0`。需说明的是：`tsc` 的 4 个错误**并非**这次升版引入——在 `main` 自己的 lockfile（锁定 0.84.2）上同样存在，根因是 pi-ai 1.x 起根入口不再导出 `complete`。升到 1.2.0 是为了让 CI 校验用户实际运行的宿主版本。
 - 同步更新 `docs/prefix-cache-principle.md` §4.3（v4-pro 价目表与假期规则）与全部 `index.ts:NNN` 行号引用，并新增覆盖 Pro 价、假期时段、未收录年份、谷值折半、摘要截断护栏与 headers-only 鉴权的测试（52 → 61）。
-
-### 待处理（不在本次变更范围）
-
-- `main` 的 CI 已经**很久没有绿过**：查 `.github/workflows/ci.yml` 的全部历史运行，v0.2.0、v0.2.1、v0.3.0 三次 main 推送全部在 `test -> Lint` 步骤失败（另有最早一次失败在 `setup-node`）。失败内容是 `tests/` 下的 27 个 `@typescript-eslint/no-explicit-any` / `no-unsafe-function-type` 错误，以及 11 个文件未过 `prettier --check`。因为 lint 先失败，`tsc` 与 `vitest` 长期实际上没有把关——这也是上述四项问题（宿主 API 失配、既有类型错误、v4-pro 计价、摘要截断）能长期潜伏的直接原因。需单独一次修复（已在后续提交中处理）。
 
 ## v0.3.0 (2026-09-29): 对齐官方现行口径复查
 

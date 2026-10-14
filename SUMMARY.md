@@ -46,11 +46,11 @@ pi-deepseek-cache/
 
 ✅ **24/24 测试全部通过**
 
-| 测试套件 | 测试数量 | 状态 |
-|---------|---------|------|
-| index.test.ts | 14 | ✓ 通过 |
-| integration.test.ts | 10 | ✓ 通过 |
-| **总计** | **24** | **✓ 全部通过** |
+| 测试套件            | 测试数量 | 状态           |
+| ------------------- | -------- | -------------- |
+| index.test.ts       | 14       | ✓ 通过         |
+| integration.test.ts | 10       | ✓ 通过         |
+| **总计**            | **24**   | **✓ 全部通过** |
 
 ## 测试覆盖
 
@@ -98,12 +98,12 @@ cp index.ts ~/.pi/agent/extensions/deepseek-cache/
 
 ## 文档索引
 
-| 文档 | 说明 |
-|------|------|
-| [README.md](README.md) | 扩展说明、安装方法、使用指南 |
-| [TESTING.md](TESTING.md) | 测试文档、运行方法、验证清单 |
-| [TEST-RESULTS.md](TEST-RESULTS.md) | 详细测试结果、覆盖率分析 |
-| [NEXT-STEPS.md](NEXT-STEPS.md) | 下一步操作、部署指南 |
+| 文档                               | 说明                         |
+| ---------------------------------- | ---------------------------- |
+| [README.md](README.md)             | 扩展说明、安装方法、使用指南 |
+| [TESTING.md](TESTING.md)           | 测试文档、运行方法、验证清单 |
+| [TEST-RESULTS.md](TEST-RESULTS.md) | 详细测试结果、覆盖率分析     |
+| [NEXT-STEPS.md](NEXT-STEPS.md)     | 下一步操作、部署指南         |
 
 ## 下一步
 

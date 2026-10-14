@@ -56,9 +56,7 @@ ls -la .pi/extensions/deepseek-cache/
 
 ```json
 {
-  "extensions": [
-    "/path/to/pi-deepseek-cache/index.ts"
-  ]
+  "extensions": ["/path/to/pi-deepseek-cache/index.ts"]
 }
 ```
 
@@ -68,9 +66,7 @@ ls -la .pi/extensions/deepseek-cache/
 
 ```json
 {
-  "extensions": [
-    "/path/to/pi-deepseek-cache/index.ts"
-  ]
+  "extensions": ["/path/to/pi-deepseek-cache/index.ts"]
 }
 ```
 

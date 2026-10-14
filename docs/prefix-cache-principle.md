@@ -21,16 +21,17 @@ Transformer 自回归推理时，每个 token 的注意力计算都需要历史 
 
 DeepSeek 在 API 侧实现 **Context Caching on Disk**（硬盘缓存），与常见的显存 KV Cache 不同：
 
-| 特性 | 说明 |
-|------|------|
-| 默认开启 | 无需改代码、无需传参即生效（api-docs.deepseek.com/guides/kv_cache） |
-| 硬盘持久化 | 每次请求触发一次硬盘缓存构建；后续请求须**完整匹配**某个已落盘的 cache prefix unit 才计为 cache hit |
-| 前缀单元独立完整 | 受 Sliding Window Attention 机制影响，每个已缓存前缀是独立完整的单元，不存在“任意重叠即复用” |
-| 不要求显式会话 ID | 命中不依赖会话标识，只取决于请求前缀字节序列 |
-| 输出仍需推理 | 缓存只加速输入的 prefill，输出仍通过计算生成，受 temperature 等参数影响 |
-| Best-effort | 不保证 100% 命中；未使用的缓存条目数小时至数日内自动清理 |
+| 特性              | 说明                                                                                                |
+| ----------------- | --------------------------------------------------------------------------------------------------- |
+| 默认开启          | 无需改代码、无需传参即生效（api-docs.deepseek.com/guides/kv_cache）                                 |
+| 硬盘持久化        | 每次请求触发一次硬盘缓存构建；后续请求须**完整匹配**某个已落盘的 cache prefix unit 才计为 cache hit |
+| 前缀单元独立完整  | 受 Sliding Window Attention 机制影响，每个已缓存前缀是独立完整的单元，不存在“任意重叠即复用”        |
+| 不要求显式会话 ID | 命中不依赖会话标识，只取决于请求前缀字节序列                                                        |
+| 输出仍需推理      | 缓存只加速输入的 prefill，输出仍通过计算生成，受 temperature 等参数影响                             |
+| Best-effort       | 不保证 100% 命中；未使用的缓存条目数小时至数日内自动清理                                            |
 
 > 官方原文摘录（api-docs.deepseek.com/guides/kv_cache 为当前口径；news0802 为 2024 首发口径，部分表述已被前者取代）：
+>
 > - The DeepSeek API Context Caching on Disk Technology is enabled by default for all users.
 > - Each user request will trigger the construction of a hard disk cache. If subsequent requests have overlapping prefixes with previous requests, the overlapping part will only be fetched from the cache, which counts as a cache hit. 〔首段总述，仍成立〕
 > - Due to the Sliding Window Attention mechanism, the storage and matching of cached prefixes differs from before. Each cached prefix is an independent, complete unit. A subsequent request can only hit the cache if it **fully matches** a cache prefix unit. 〔当前口径；与上方“任意重叠即复用”相反，以本条为准〕
@@ -60,9 +61,11 @@ DeepSeek 在 API 侧实现 **Context Caching on Disk**（硬盘缓存），与�
 官方列出三种互补的持久化策略，任意一条均可产生一个独立的 cache prefix unit：
 
 1. **Persistence at request boundaries（请求边界持久化）**
+
    > Each request will produce two cache prefix units at the end position of the user input and the end position of the model output. A subsequent request can hit the cache if it fully matches them.
 
 2. **Common prefix detection persistence（公共前缀检测持久化）**
+
    > When the system detects a common prefix across multiple requests, it will persist that common prefix as an independent cache prefix unit. A subsequent request can hit the cache if it fully reuses that cache prefix unit.
 
 3. **Persistence at fixed token intervals（固定 token 间隔持久化）**
@@ -79,6 +82,7 @@ DeepSeek 在 API 侧实现 **Context Caching on Disk**（硬盘缓存），与�
 具体消息形态（官方 JSON）：
 
 **First Request**
+
 ```json
 messages: [
     {"role": "system", "content": "You are a helpful assistant"},
@@ -87,6 +91,7 @@ messages: [
 ```
 
 **Second Request**
+
 ```json
 messages: [
     {"role": "system", "content": "You are a helpful assistant"},
@@ -107,6 +112,7 @@ messages: [
 具体形态：
 
 **First Request**
+
 ```json
 messages: [
     {"role": "system", "content": "You are an experienced financial report analyst..."},
@@ -115,6 +121,7 @@ messages: [
 ```
 
 **Second Request**（仅尾部指令不同）
+
 ```json
 messages: [
     {"role": "system", "content": "You are an experienced financial report analyst..."},
@@ -123,6 +130,7 @@ messages: [
 ```
 
 **Third Request**
+
 ```json
 messages: [
     {"role": "system", "content": "You are an experienced financial report analyst..."},
@@ -202,11 +210,11 @@ DeepSeek 线上协议（api/create-chat-completion）返回：
 ```ts
 // packages/llm/llm-deepseek/src/types.ts:157
 interface WireUsage {
-  prompt_tokens: number                          // 总输入 = hit + miss
-  prompt_cache_hit_tokens?: number
-  prompt_cache_miss_tokens?: number
-  prompt_tokens_details?: { cached_tokens?: number } // OpenAI 兼容写法
-  completion_tokens: number
+  prompt_tokens: number; // 总输入 = hit + miss
+  prompt_cache_hit_tokens?: number;
+  prompt_cache_miss_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number }; // OpenAI 兼容写法
+  completion_tokens: number;
 }
 ```
 
@@ -222,11 +230,11 @@ packages/llm/llm/src/types.ts:130 与 docs/subsystems/llm-streaming.md 统一规
 
 ```ts
 interface TokenUsage {
-  inputTokens: number        // 仅未命中部分
-  outputTokens: number
-  cacheReadTokens?: number   // 命中部分（单独计费，约 0.1 倍单价）
-  cacheWriteTokens?: number  // DeepSeek 不报告写入量
-  reasoningTokens?: number   // 已含在 outputTokens 内，勿重复累加
+  inputTokens: number; // 仅未命中部分
+  outputTokens: number;
+  cacheReadTokens?: number; // 命中部分（单独计费，约 0.1 倍单价）
+  cacheWriteTokens?: number; // DeepSeek 不报告写入量
+  reasoningTokens?: number; // 已含在 outputTokens 内，勿重复累加
 }
 // 计费输入 = inputTokens + cacheReadTokens + cacheWriteTokens
 ```
@@ -239,13 +247,12 @@ interface TokenUsage {
 //  api/create-chat-completion); the harness TokenUsage convention is
 // DISJOINT counts, so cache reads are subtracted out of inputTokens.
 export function mapUsage(usage: WireUsage): TokenUsage {
-  const cacheRead = usage.prompt_tokens_details?.cached_tokens
-                 ?? usage.prompt_cache_hit_tokens
+  const cacheRead = usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens;
   return {
     inputTokens: usage.prompt_tokens - (cacheRead ?? 0),
     outputTokens: usage.completion_tokens,
-    ...cacheRead !== undefined ? { cacheReadTokens: cacheRead } : {},
-  }
+    ...(cacheRead !== undefined ? { cacheReadTokens: cacheRead } : {}),
+  };
 }
 ```
 
@@ -258,10 +265,10 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 - 缓存命中与未命中按**不同单价**计费，两者的差额即节省额。
 - **官方现行价目表**（[Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing)，每百万 token，美元）：
 
-  | 模型 | 命中 peak | 命中 off-peak | 未命中 peak | 未命中 off-peak |
-  |---|---|---|---|---|
-  | `deepseek-flash`（= DeepSeek-V4.1-Flash） | 0.006 | 0.003 | 0.30 | 0.15 |
-  | `deepseek-v4-pro` | 0.044 | 0.022 | 1.32 | 0.66 |
+  | 模型                                      | 命中 peak | 命中 off-peak | 未命中 peak | 未命中 off-peak |
+  | ----------------------------------------- | --------- | ------------- | ----------- | --------------- |
+  | `deepseek-flash`（= DeepSeek-V4.1-Flash） | 0.006     | 0.003         | 0.30        | 0.15            |
+  | `deepseek-v4-pro`                         | 0.044     | 0.022         | 1.32        | 0.66            |
 
   峰值为 01:00-04:00 / 06:00-10:00 UTC 周一至五，**并排除中国公共假期**（官方注(2)），其余为谷值 = 峰值 / 2。
 
@@ -295,14 +302,14 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 
 以下任一变化都会使可复用前缀在变化点截断，之后全部按 miss 计费：
 
-| 类别 | 典型例子 | 说明 |
-|------|----------|------|
-| **System 变化** | persona/prompt 模板改动、动态时间戳注入 | Harness 中 system 来自 ctx.systemPrompt，一旦 persona 切换即新前缀 |
-| **Tools 变化** | 工具增删、JSON Schema 字段顺序变化 | 工具数组序列化参与前缀比较 |
-| **历史重写** | 编辑/重排已发送的 message、compaction 替换 head | compaction-basic 明确标记 Replacing rather than append-only. Each checkpoint invalidates reuse from the first replaced history token |
-| **路由变化** | 切换 provider/model | 见命中条件 3.1 |
-| **易变内容前置** | 将时间戳、随机 ID、大块非确定性工具输出放在靠前位置 | 使可复用单元变短；按官方现行口径，需**完整匹配**某个已落盘单元才能命中，故稳定内容应尽量越过所有易变段 |
-| **非追加式写入** | 持久化修复重写较早历史（Harness 已规避：修复结果 append） | 多个包文档强调 append without rewriting earlier history |
+| 类别             | 典型例子                                                  | 说明                                                                                                                                 |
+| ---------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| **System 变化**  | persona/prompt 模板改动、动态时间戳注入                   | Harness 中 system 来自 ctx.systemPrompt，一旦 persona 切换即新前缀                                                                   |
+| **Tools 变化**   | 工具增删、JSON Schema 字段顺序变化                        | 工具数组序列化参与前缀比较                                                                                                           |
+| **历史重写**     | 编辑/重排已发送的 message、compaction 替换 head           | compaction-basic 明确标记 Replacing rather than append-only. Each checkpoint invalidates reuse from the first replaced history token |
+| **路由变化**     | 切换 provider/model                                       | 见命中条件 3.1                                                                                                                       |
+| **易变内容前置** | 将时间戳、随机 ID、大块非确定性工具输出放在靠前位置       | 使可复用单元变短；按官方现行口径，需**完整匹配**某个已落盘单元才能命中，故稳定内容应尽量越过所有易变段                               |
+| **非追加式写入** | 持久化修复重写较早历史（Harness 已规避：修复结果 append） | 多个包文档强调 append without rewriting earlier history                                                                              |
 
 > 设计原则：把稳定内容放前、易变内容放后、只追加不重写。
 
@@ -317,18 +324,19 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 **为何强制**：system 是请求前缀的第一个字节；任何顺序抖动或中途重写都会使后续所有 token 的缓存失效。
 
 **怎么做**：
+
 - 以 PromptSection { name, order, text, complete? } 注册，order 决定拼接顺序（约定：-100 为 harness 身份、0 为部署 persona、100-199 为工具引导），同一层内重名或非有限 order 直接抛错。
 - SystemPrompt.assemble() 将 global + scoped 的 sections 按 order 升序合并，仅在末尾以两次换行连接；若存在 complete: true 的段，则在 waterfall 之后将其作为唯一段恢复，保证字节确定性。
 
 **证据链**：
 
-| 证据 | 路径与行号 | 关键行 |
-|------|------------|--------|
-| 类型定义 | node_modules/@deepseek-ai/dsh-system-prompt/lib/types/index.d.ts:47 | export interface PromptSection { readonly name: string; readonly order: number; readonly text: string | ((context: AssembleContext) => string); readonly complete?: boolean; } |
-| 顺序拼接 | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:263 | const sectionDefinitions = [...sectionByName.values()].sort((a, b) => a.order - b.order); |
-| 组装入口 | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:240 | async assemble(context = {}) { // 收集 sections/contexts/tools/variables 到 orderTools 到 waterfall } |
-| 完整段唯一性 | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:265 | if (completeSections.length > 1) throw new Error(multiple complete prompt sections are active); |
-| 工具排序接入 | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:280 | tools: orderTools(collected, this.toolOrder, knownNames), |
+| 证据         | 路径与行号                                                          | 关键行                                                                                                |
+| ------------ | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| 类型定义     | node_modules/@deepseek-ai/dsh-system-prompt/lib/types/index.d.ts:47 | export interface PromptSection { readonly name: string; readonly order: number; readonly text: string | ((context: AssembleContext) => string); readonly complete?: boolean; } |
+| 顺序拼接     | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:263        | const sectionDefinitions = [...sectionByName.values()].sort((a, b) => a.order - b.order);             |
+| 组装入口     | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:240        | async assemble(context = {}) { // 收集 sections/contexts/tools/variables 到 orderTools 到 waterfall } |
+| 完整段唯一性 | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:265        | if (completeSections.length > 1) throw new Error(multiple complete prompt sections are active);       |
+| 工具排序接入 | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:280        | tools: orderTools(collected, this.toolOrder, knownNames),                                             |
 
 > 源码对照：上游仓库 packages/core/system-prompt/src/index.ts 中同名 assemble / orderTools 逻辑一致；本文行号以安装产物为准，仓库源码行号可能偏移数行，请以符号搜索为准。
 
@@ -337,18 +345,19 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 **为何强制**：tools 数组的 JSON 序列化直接参与前缀比较；不同机器、不同注册顺序若导致工具顺序不同，则 system 之后的首个字节即分叉。
 
 **怎么做**：
+
 - 未配置 toolOrder 时，orderTools 回退为按 compareToolNames 的码点（code-unit）字典序排序——与 locale 无关，保证跨机器一致。
 - 已配置 toolOrder 时，未列名工具在其锚点位置按字典序插入；列名未知或重复直接抛错。
 - 判等时 sameSchema 使用 JSON.stringify 逐项比对，且 headerEquals 要求工具数组按顺序逐项相等，任何顺序差异即判定为 header 变化。
 
 **证据链**：
 
-| 证据 | 路径与行号 | 关键行 |
-|------|------------|--------|
-| 排序入口 | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:44 | function orderTools(tools, toolOrder, knownNames) { if (toolOrder === void 0) return tools.sort(compareToolNames); ... } |
-| 字典序比较 | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:54 | function compareToolNames(a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0; } |
-| 未列名插入 | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:50 | const rest = tools.filter((tool) => !listed.has(tool.name)).sort(compareToolNames); |
-| 模式判等 | node_modules/@deepseek-ai/dsh-session/lib/types/request-header.js:29 | function sameSchema(a, b) { return JSON.stringify(a) === JSON.stringify(b); } |
+| 证据         | 路径与行号                                                           | 关键行                                                                                                                       |
+| ------------ | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| 排序入口     | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:44          | function orderTools(tools, toolOrder, knownNames) { if (toolOrder === void 0) return tools.sort(compareToolNames); ... }     |
+| 字典序比较   | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:54          | function compareToolNames(a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0; }                                   |
+| 未列名插入   | node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:50          | const rest = tools.filter((tool) => !listed.has(tool.name)).sort(compareToolNames);                                          |
+| 模式判等     | node_modules/@deepseek-ai/dsh-session/lib/types/request-header.js:29 | function sameSchema(a, b) { return JSON.stringify(a) === JSON.stringify(b); }                                                |
 | 顺序敏感判等 | node_modules/@deepseek-ai/dsh-session/lib/types/request-header.js:38 | export function headerEquals(a, b) { ... return at.length === bt.length && at.every((tool, i) => sameSchema(tool, bt[i])); } |
 
 ### 6.3 Wire 确定性序列化（serializeMessages）
@@ -356,23 +365,25 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 **为何强制**：即使 harness 内存中 Message 数组顺序一致，若 wire 序列化时对 tool-result 拆分、文本拼接或空消息处理不一致，线上字节仍会分叉。
 
 **怎么做**：
+
 - serializeMessages(messages) 将每个 harness message 按角色确定性映射：system 到单条 system；assistant 到单条 assistant（含 tool-call）；user 到文本 user + 每条 tool-result 各一条 role tool 消息；空文本与 (no output) 兜底均有明确分支。
 - serializeRequest / serializeRequestWithImages 在其上先压入 system（若有），再追加 serializeMessages 结果，保证 wire 顺序与 harness 顺序一一对应；图片路径经 offloadRequestImages 与 serializeMessagesWithImages 确定性落盘。
 
 **证据链**：
 
-| 证据 | 路径与行号 | 关键行 |
-|------|------------|--------|
-| 文本序列化 | node_modules/@deepseek-ai/dsh-llm-deepseek/lib/index.js:117 | function serializeMessages(messages) { const wire = []; for (const message of messages) { ... } return wire; } |
-| 声明 | node_modules/@deepseek-ai/dsh-llm-deepseek/lib/types/serialize.d.ts:33 | export declare function serializeMessages(messages: Message[]): WireMessage[]; |
-| 请求组装 | node_modules/@deepseek-ai/dsh-llm-deepseek/lib/index.js:241 | function serializeRequest(options, defaults = {}) { const messages = []; if (options.system !== void 0) messages.push({ role: system, content: options.system }); messages.push(...serializeMessages(options.messages)); return requestWithMessages(options, messages, defaults); } |
-| 图片确定性 | node_modules/@deepseek-ai/dsh-llm-deepseek/lib/index.js:155 | async function serializeMessagesWithImages(messages, attachments, signal) { ... } |
+| 证据       | 路径与行号                                                             | 关键行                                                                                                                                                                                                                                                                              |
+| ---------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 文本序列化 | node_modules/@deepseek-ai/dsh-llm-deepseek/lib/index.js:117            | function serializeMessages(messages) { const wire = []; for (const message of messages) { ... } return wire; }                                                                                                                                                                      |
+| 声明       | node_modules/@deepseek-ai/dsh-llm-deepseek/lib/types/serialize.d.ts:33 | export declare function serializeMessages(messages: Message[]): WireMessage[];                                                                                                                                                                                                      |
+| 请求组装   | node_modules/@deepseek-ai/dsh-llm-deepseek/lib/index.js:241            | function serializeRequest(options, defaults = {}) { const messages = []; if (options.system !== void 0) messages.push({ role: system, content: options.system }); messages.push(...serializeMessages(options.messages)); return requestWithMessages(options, messages, defaults); } |
+| 图片确定性 | node_modules/@deepseek-ai/dsh-llm-deepseek/lib/index.js:155            | async function serializeMessagesWithImages(messages, attachments, signal) { ... }                                                                                                                                                                                                   |
 
 ### 6.4 请求头折叠与冻结（canonicalHeader, deepFreeze, callConfigEquals, foldRequestHeader）
 
 **为何强制**：DeepSeek 的命中要求前缀已持久化且完全匹配。Harness 用 request/header 事件记录非历史的请求封装（config + system + tools + adapterDefaults），并通过折叠与冻结保证内存中用于发请求的 envelope 与日志中用于重建的 envelope 字节一致，避免静默漂移。
 
 **怎么做**：
+
 - **规范化**：canonicalHeader 将空 system / 空 tools 归一为缺省字段，使空与缺省在日志与比较中同一表示。
 - **变更检测**：callConfigEquals 对 provider/model/reasoningEffort/temperature/maxTokens/stop 逐字段判等（stop 逐元素比对）；headerEquals 在其上叠加 system 与有序 tools 的 sameSchema 比对，仅当真实变化时才记录新 request/header 快照。
 - **折叠重建**：foldRequestHeader(events) 遍历日志，取最后一条 request/header 的规范化结果；任何持有日志的人（包括离线回放）都能重建该请求构建时生效的 envelope。
@@ -380,31 +391,32 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 
 **证据链**：
 
-| 证据 | 路径与行号 | 关键行 |
-|------|------------|--------|
-| 规范化 | node_modules/@deepseek-ai/dsh-session/lib/types/request-header.js:17 | export function canonicalHeader(header) { ... header.system !== undefined && header.system.length > 0 ? { system: header.system } : {} ... } |
-| 配置判等 | node_modules/@deepseek-ai/dsh-llm/lib/index.js:68 | function callConfigEquals(a, b) { if (a.provider !== b.provider || a.model !== b.model || ... ) return false; ... } |
-| 冻结 | node_modules/@deepseek-ai/dsh-llm/lib/index.js:98 | function deepFreeze(value) { const seen = new WeakSet(); const pending = [{ kind: visit, node: value }]; ... Object.freeze(node); ... } |
-| 准备调用冻结 | node_modules/@deepseek-ai/dsh-llm/lib/index.js:1391 | const resolvedConfig = deepFreeze(structuredClone(resolved.config)); const adapterDefaults = deepFreeze({ ... }); |
-| 折叠 | node_modules/@deepseek-ai/dsh-session/lib/types/request-header.js:57 | export function foldRequestHeader(events, from) { let state = from; for (const event of events) if (event.type === request/header) state = canonicalHeader(event.data.header); return state; } |
-| 不变量校验 | node_modules/@deepseek-ai/dsh-agent-loop/lib/invariant.js:15 | ctx.on(llm/stream, (options, next) => { if (!isAgentLoopRequest(options)) return next(); if (!Object.isFrozen(options)) fail(a loop-built request must be frozen); ... const header = foldRequestHeader(events); if (JSON.stringify(options.messages) !== JSON.stringify(expected)) fail(...); ... } |
+| 证据         | 路径与行号                                                           | 关键行                                                                                                                                                                                                                                                                                               |
+| ------------ | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 规范化       | node_modules/@deepseek-ai/dsh-session/lib/types/request-header.js:17 | export function canonicalHeader(header) { ... header.system !== undefined && header.system.length > 0 ? { system: header.system } : {} ... }                                                                                                                                                         |
+| 配置判等     | node_modules/@deepseek-ai/dsh-llm/lib/index.js:68                    | function callConfigEquals(a, b) { if (a.provider !== b.provider                                                                                                                                                                                                                                      |     | a.model !== b.model |     | ... ) return false; ... } |
+| 冻结         | node_modules/@deepseek-ai/dsh-llm/lib/index.js:98                    | function deepFreeze(value) { const seen = new WeakSet(); const pending = [{ kind: visit, node: value }]; ... Object.freeze(node); ... }                                                                                                                                                              |
+| 准备调用冻结 | node_modules/@deepseek-ai/dsh-llm/lib/index.js:1391                  | const resolvedConfig = deepFreeze(structuredClone(resolved.config)); const adapterDefaults = deepFreeze({ ... });                                                                                                                                                                                    |
+| 折叠         | node_modules/@deepseek-ai/dsh-session/lib/types/request-header.js:57 | export function foldRequestHeader(events, from) { let state = from; for (const event of events) if (event.type === request/header) state = canonicalHeader(event.data.header); return state; }                                                                                                       |
+| 不变量校验   | node_modules/@deepseek-ai/dsh-agent-loop/lib/invariant.js:15         | ctx.on(llm/stream, (options, next) => { if (!isAgentLoopRequest(options)) return next(); if (!Object.isFrozen(options)) fail(a loop-built request must be frozen); ... const header = foldRequestHeader(events); if (JSON.stringify(options.messages) !== JSON.stringify(expected)) fail(...); ... } |
 
 ### 6.5 Compaction verbatim 回放（summarizer 回放 system+tools+shadowed messages）
 
 **为何强制**：compaction 若用独立的总结专用 system 或重排历史，会使辅助调用的前缀与上一轮路由请求的前缀分叉，浪费 warm KV cache；同时 checkpoint 本身若非位姿精确替换，会破坏后续请求的公共前缀检测。
 
 **怎么做**：
+
 - 默认总结器 summarizeWithLlm verbatim 回放会话自身的 system、tools 与被遮蔽区消息前缀，仅在末尾追加 COMPACTION_INSTRUCTION 作为最后一条 user 消息，使辅助调用成为上一轮路由请求的真前缀扩展，复用 warm cache。
 - 总结输出经 summaryText 过滤仅保留文本，frameSummary 以 CHECKPOINT_PREAMBLE + compacted-summary 标签包装后作为替换型 user 消息落盘；后续请求将该 checkpoint 视为已确立背景继续追加。
 
 **证据链**：
 
-| 证据 | 路径与行号 | 关键行 |
-|------|------------|--------|
-| 指令设计注释 | node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js:212 | The summarization directive, delivered as the FINAL user message after the replayed conversation rather than as a distinct summarizer system prompt. Keeping the conversation own system prompt, tools, and message prefix in front of it makes the auxiliary call a genuine prefix of the last routed request, so the provider KV cache is reused instead of invalidated. |
-| verbatim 回放 | node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js:280 | const messages = [...input.messages, createUserMessage({ content: [{ type: text, text: COMPACTION_INSTRUCTION }], source: { kind: plugin, plugin: dsh-compaction-basic } })]; |
-| 透传 system/tools | node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js:294 | const options = { provider: target.provider, model: target.model, messages, ...input.system === void 0 ? {} : { system: input.system }, ...input.tools === void 0 ? {} : { tools: [...input.tools] }, maxTokens: config.maxTokens, sessionId: agent.session.id, purpose: compaction, ... } |
-| 包装落盘 | node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js:322 | function frameSummary(summary) { return [{ type: text, text: CHECKPOINT_PREAMBLE + summary_open_tag }, ...summary, { type: text, text: SUMMARY_CLOSE_TAG }]; } |
+| 证据              | 路径与行号                                                      | 关键行                                                                                                                                                                                                                                                                                                                                                                     |
+| ----------------- | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 指令设计注释      | node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js:212 | The summarization directive, delivered as the FINAL user message after the replayed conversation rather than as a distinct summarizer system prompt. Keeping the conversation own system prompt, tools, and message prefix in front of it makes the auxiliary call a genuine prefix of the last routed request, so the provider KV cache is reused instead of invalidated. |
+| verbatim 回放     | node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js:280 | const messages = [...input.messages, createUserMessage({ content: [{ type: text, text: COMPACTION_INSTRUCTION }], source: { kind: plugin, plugin: dsh-compaction-basic } })];                                                                                                                                                                                              |
+| 透传 system/tools | node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js:294 | const options = { provider: target.provider, model: target.model, messages, ...input.system === void 0 ? {} : { system: input.system }, ...input.tools === void 0 ? {} : { tools: [...input.tools] }, maxTokens: config.maxTokens, sessionId: agent.session.id, purpose: compaction, ... }                                                                                 |
+| 包装落盘          | node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js:322 | function frameSummary(summary) { return [{ type: text, text: CHECKPOINT_PREAMBLE + summary_open_tag }, ...summary, { type: text, text: SUMMARY_CLOSE_TAG }]; }                                                                                                                                                                                                             |
 
 ---
 
@@ -414,11 +426,11 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 
 ### 7.1 三钩子如何复刻 Harness 手段
 
-| Pi 钩子 | 触发时机 | 复刻的 Harness 手段 | 本项目做法 |
-|---------|----------|---------------------|------------|
-| context | 每次组装上下文、即将并入请求前 | 固定 System Prompt 的易变内容后置与 append-only | 过滤 customType volatile-scratch 的易变消息，使其不进入 wire 前缀（index.ts:722 pi.on(context, ...)），避免时间戳/草稿截断稳定前缀 |
-| before_provider_request | provider payload 已组装、尚未发送 | 工具字典序 + Wire 确定性序列化 + 请求头折叠的发送前最后一致性门 | 见 7.2 |
-| session_before_compact | 压缩前，允许扩展接管总结 | Compaction verbatim 回放（**未对齐**，见 7.4） | 以 `deepseek-flash`（兼容 legacy 名 `deepseek-v4-flash`）@ temperature 0 做确定性总结，结果按 SHA-256 去重并落盘 summary-cache.json |
+| Pi 钩子                 | 触发时机                          | 复刻的 Harness 手段                                             | 本项目做法                                                                                                                          |
+| ----------------------- | --------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| context                 | 每次组装上下文、即将并入请求前    | 固定 System Prompt 的易变内容后置与 append-only                 | 过滤 customType volatile-scratch 的易变消息，使其不进入 wire 前缀（index.ts:722 pi.on(context, ...)），避免时间戳/草稿截断稳定前缀  |
+| before_provider_request | provider payload 已组装、尚未发送 | 工具字典序 + Wire 确定性序列化 + 请求头折叠的发送前最后一致性门 | 见 7.2                                                                                                                              |
+| session_before_compact  | 压缩前，允许扩展接管总结          | Compaction verbatim 回放（**未对齐**，见 7.4）                  | 以 `deepseek-flash`（兼容 legacy 名 `deepseek-v4-flash`）@ temperature 0 做确定性总结，结果按 SHA-256 去重并落盘 summary-cache.json |
 
 #### context — 易变内容隔离
 
@@ -444,7 +456,8 @@ pi.on("before_provider_request", (event, ctx) => {
   if (Array.isArray(payload.tools) && payload.tools.length > 1) {
     // 码点字典序排序（localeCompare 依赖 ICU/locale，跨环境可能不同序）
     const sorted = [...payload.tools].sort((a, b) => {
-      const na = getToolName(a), nb = getToolName(b);
+      const na = getToolName(a),
+        nb = getToolName(b);
       return na < nb ? -1 : na > nb ? 1 : 0;
     });
     // 仅在顺序确实改变时替换
@@ -468,9 +481,12 @@ pi.on("before_provider_request", (event, ctx) => {
 // index.ts:794
 pi.on("session_before_compact", async (event, ctx) => {
   flushPendingWrites();
-  const { messagesToSummarize, firstKeptEntryId, tokensBefore, previousSummary } = event.preparation;
+  const { messagesToSummarize, firstKeptEntryId, tokensBefore, previousSummary } =
+    event.preparation;
   const history = serializeConversation(convertToLlm(messagesToSummarize));
-  const text = previousSummary ? "【上次摘要】" + previousSummary + "【新增历史】" + history : history;
+  const text = previousSummary
+    ? "【上次摘要】" + previousSummary + "【新增历史】" + history
+    : history;
   const key = createHash("sha256").update(text).digest("hex");
   let summary = summaryCache.get(key);
   if (!summary) {
@@ -478,7 +494,14 @@ pi.on("session_before_compact", async (event, ctx) => {
     setSummaryCache(summaryCache, key, summary);
     saveSummaryCache(summaryCache);
   }
-  return { compaction: { summary, firstKeptEntryId, tokensBefore, details: { summarizer: "deepseek-v4-flash" } } };
+  return {
+    compaction: {
+      summary,
+      firstKeptEntryId,
+      tokensBefore,
+      details: { summarizer: "deepseek-v4-flash" },
+    },
+  };
 });
 ```
 
@@ -490,12 +513,12 @@ pi.on("session_before_compact", async (event, ctx) => {
 
 **差异与后果**（不得再声称 parity）：
 
-| 维度 | Harness verbatim 回放 | 本项目 |
-|---|---|---|
-| 前缀形态 | 上一轮请求的真前缀扩展 | 全新前缀，与上一轮无字节重合 |
-| 缓存效果 | 复用 warm cache，仅 prefill 新增的指令 | 每次 compaction 冷启动，全量 prefill 整段历史 |
-| 稳定内容 | 指令置于最后，历史变动不影响前缀 | 指令与历史拼接在同一段文本内，历史一变即全量重算 |
-| 路由 | 透传原 provider/model | 固定走 `deepseek-flash`（官方注(1)：legacy 名已退役但仍受理） |
+| 维度     | Harness verbatim 回放                  | 本项目                                                        |
+| -------- | -------------------------------------- | ------------------------------------------------------------- |
+| 前缀形态 | 上一轮请求的真前缀扩展                 | 全新前缀，与上一轮无字节重合                                  |
+| 缓存效果 | 复用 warm cache，仅 prefill 新增的指令 | 每次 compaction 冷启动，全量 prefill 整段历史                 |
+| 稳定内容 | 指令置于最后，历史变动不影响前缀       | 指令与历史拼接在同一段文本内，历史一变即全量重算              |
+| 路由     | 透传原 provider/model                  | 固定走 `deepseek-flash`（官方注(1)：legacy 名已退役但仍受理） |
 
 补充：摘要缓存 key 为 `sha256(序列化历史全文)`，需历史**逐字节相同**才能命中。因此“跨会话复用”在实践中几乎不会发生（跨会话历史必然不同），真实命中场景是同会话内对同一压缩集合重复总结。
 
@@ -528,14 +551,14 @@ pi.on("session_before_compact", async (event, ctx) => {
 
 ### 7.3 遥测与可视化（P1）
 
-| 能力 | 实现 |
-|------|------|
-| 监听 message_end 累积 cacheRead / input / cacheWrite / turns，并记录 wire model | index.ts message_end 处理 |
-| 落盘 ~/.pi/agent/extensions/deepseek-cache/stats.json | atomicWriteJson |
-| 状态栏实时显示 cache xx.x% · Nt（累计口径） | index.ts status bar |
-| /cache-stats 同时展示**累计**命中率与**本轮**命中率（官方为按请求逐次统计口径，两者不同） | index.ts `StatsView.lastTurnHitRate` |
+| 能力                                                                                                                                             | 实现                                         |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------- |
+| 监听 message_end 累积 cacheRead / input / cacheWrite / turns，并记录 wire model                                                                  | index.ts message_end 处理                    |
+| 落盘 ~/.pi/agent/extensions/deepseek-cache/stats.json                                                                                            | atomicWriteJson                              |
+| 状态栏实时显示 cache xx.x% · Nt（累计口径）                                                                                                      | index.ts status bar                          |
+| /cache-stats 同时展示**累计**命中率与**本轮**命中率（官方为按请求逐次统计口径，两者不同）                                                        | index.ts `StatsView.lastTurnHitRate`         |
 | 节省额按当前模型 + peak/off-peak 时段计价（`saved = cacheRead/1e6 * (miss − hit)`），并展示所用模型、时段与单价；小额用 4 位小数避免丢失有效信息 | index.ts `currentPricing` / `buildStatsView` |
-| 官方 usage 无 cache write 字段，未观测到非零写入时隐藏「缓存写入」行（避免恒为 0 的死 UI） | index.ts `reportsCacheWrite` |
+| 官方 usage 无 cache write 字段，未观测到非零写入时隐藏「缓存写入」行（避免恒为 0 的死 UI）                                                       | index.ts `reportsCacheWrite`                 |
 
 ---
 
@@ -577,4 +600,4 @@ pi.on("session_before_compact", async (event, ctx) => {
 
 ---
 
-*最后更新：2026-09-29（对齐官方现行 kv_cache 口径与现行价目表）· 维护者：pi-deepseek-cache*
+_最后更新：2026-09-29（对齐官方现行 kv_cache 口径与现行价目表）· 维护者：pi-deepseek-cache_

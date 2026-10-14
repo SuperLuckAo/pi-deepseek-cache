@@ -20,21 +20,21 @@
 
 ### 修复：宿主 API（pi 1.2.x）
 
-- **`complete` 已不是 `@earendil-works/pi-ai` 的根导出**：pi-ai 1.x 把旧的全局 `stream()` / `complete()` 收进 `@earendil-works/pi-ai/compat`（该文件自述：*“Temporary compatibility entrypoint… This module is deleted with the coding-agent ModelManager migration.”*），根入口只剩 `createModels()` 与各 provider 工厂。
-  - 运行时不受影响：pi 的扩展加载器把 `@earendil-works/pi-ai` 依旧指向 `compat.js`（`dist/core/extensions/loader.js` 注释：*“Extensions resolve the pi-ai root to the compat entrypoint (a strict superset of the core entrypoint): existing extensions using the old global API keep working at runtime until compat is removed.”*）。但类型层面已经失配，且 compat 明确是待删除的过渡层。
+- **`complete` 已不是 `@earendil-works/pi-ai` 的根导出**：pi-ai 1.x 把旧的全局 `stream()` / `complete()` 收进 `@earendil-works/pi-ai/compat`（该文件自述：_“Temporary compatibility entrypoint… This module is deleted with the coding-agent ModelManager migration.”_），根入口只剩 `createModels()` 与各 provider 工厂。
+  - 运行时不受影响：pi 的扩展加载器把 `@earendil-works/pi-ai` 依旧指向 `compat.js`（`dist/core/extensions/loader.js` 注释：_“Extensions resolve the pi-ai root to the compat entrypoint (a strict superset of the core entrypoint): existing extensions using the old global API keep working at runtime until compat is removed.”_）。但类型层面已经失配，且 compat 明确是待删除的过渡层。
   - 现已改用官方推荐路径 `ctx.modelRegistry.complete(model, context, options)`：由宿主在请求时解析鉴权（API key / OAuth / headers），因此不再需要手传 `apiKey` / `headers`。由此**扩展不再导入 `@earendil-works/pi-ai` 的任何符号**，彻底摆脱对 compat 过渡层的依赖。
 - **`ctx.ui.custom` 的 `done` 形参**：1.2.x 下 `done` 推断为 `(result: unknown) => void`，与 overlay 构造函数的 `() => void` 不兼容；改为显式 `ctx.ui.custom<void>(...)`。
 - **`context` 事件的消息类型**：1.2.x 的 `AgentMessage` 联合类型不再声明 `customType`（改为由各扩展通过 `CustomAgentMessages` 声明合并自行扩展），旧实现把它断言成自定义接口才能通过类型检查。现改为结构化读取，并顺手修掉一个真实隐患：旧实现遇到 `event.messages` 不是数组时会返回 `{ messages: [] }`，**等于丢弃全部消息**；现改为返回 `undefined`（不改动）——鉴于该事件下丢失消息会直接改变送给模型的上下文，这比默默清空安全得多。
 
 ### 修复：DeepSeek 计价口径
 
-- **`deepseek-v4-pro` 计价少算约 7 倍（严重）**：v0.3.0 依据 V4.1-Flash 发布公告中“自 2026-09-14 起 v4-pro 请求全部路由至 V4.1-Flash 并按 Flash 价结算”的表述，把 v4-pro 映射到 Flash 价。但该计划**已被官方撤销**：官方变更日志在 **2026-09-10**（即原定切换日之前）声明 *“we have decided to continue providing API services for DeepSeek V4 Pro after September 14, 2026, with the billing method remaining unchanged.”*。官方价目表也一直列着 v4-pro 自身价（命中 0.044 / 未命中 1.32 峰值，模型版本 DeepSeek-V4-Pro-0813），pi 自身的模型目录同样是 `cacheRead 0.044 / input 1.32`。现改回官方价目表：命中价少算约 7.3 倍（0.044 / 0.006）、未命中价少算约 4.4 倍（1.32 / 0.30）的问题已修正。
+- **`deepseek-v4-pro` 计价少算约 7 倍（严重）**：v0.3.0 依据 V4.1-Flash 发布公告中“自 2026-09-14 起 v4-pro 请求全部路由至 V4.1-Flash 并按 Flash 价结算”的表述，把 v4-pro 映射到 Flash 价。但该计划**已被官方撤销**：官方变更日志在 **2026-09-10**（即原定切换日之前）声明 _“we have decided to continue providing API services for DeepSeek V4 Pro after September 14, 2026, with the billing method remaining unchanged.”_。官方价目表也一直列着 v4-pro 自身价（命中 0.044 / 未命中 1.32 峰值，模型版本 DeepSeek-V4-Pro-0813），pi 自身的模型目录同样是 `cacheRead 0.044 / input 1.32`。现改回官方价目表：命中价少算约 7.3 倍（0.044 / 0.006）、未命中价少算约 4.4 倍（1.32 / 0.30）的问题已修正。
 - **峰值时段未排除中国公共假期**：官方注(2) 定义峰值为 01:00-04:00 / 06:00-10:00 UTC 的周一至五，**并排除中国公共假期**（全部节假日与周末均为谷值）。旧实现只按 UTC 工作日判断，在中国法定假期的上述窗口内会把谷值当峰值，**高估**节省额一倍。现按国内官方节假日安排（国办发明电〔2025〕7号）以 UTC+8 自然日判定并排除；未收录年份不匹配任何区间，退化为旧行为（只会保守高估，不会静默低估）。
 - **legacy 名 `deepseek-v4-flash-vision-exp` 无需新增映射（复核后修正）**：该名字原本已被 `lookupPricing` 的 `startsWith` 回退归入 `deepseek-v4-flash`，取价正确。真正的问题是这层回退行为未被文档化，已补注释，并移除一个永远不会被命中的冗余键。
 
 ### 修复：摘要可信度
 
-- **截断的摘要会被当成检查点（严重，接受代码审查建议）**：`summarizeWithFlash` 从未检查 `stopReason`。官方 pi-ai 把 `finish_reason: "length"` 映射为 `stopReason: "length"` 并照常 resolve，且 error 路径保留已生成的局部 `content`。已生成的局部摘要会被 pi **原文替换历史**，并按输入哈希写进 `summary-cache.json`——一次截断不但丢上下文，还会被缓存固化。pi 自身明确拒绝该情形（`dist/core/compaction/compaction.js`：*“A length stop contains partial text and must not become a session checkpoint.”*）。现内联同语义判定（该函数未从包根导出），遇 `error` / `length` 告警并回退默认 compaction。
+- **截断的摘要会被当成检查点（严重，接受代码审查建议）**：`summarizeWithFlash` 从未检查 `stopReason`。官方 pi-ai 把 `finish_reason: "length"` 映射为 `stopReason: "length"` 并照常 resolve，且 error 路径保留已生成的局部 `content`。已生成的局部摘要会被 pi **原文替换历史**，并按输入哈希写进 `summary-cache.json`——一次截断不但丢上下文，还会被缓存固化。pi 自身明确拒绝该情形（`dist/core/compaction/compaction.js`：_“A length stop contains partial text and must not become a session checkpoint.”_）。现内联同语义判定（该函数未从包根导出），遇 `error` / `length` 告警并回退默认 compaction。
 - **鉴权预检会误判纯 headers/OAuth 类 provider**：官方 `ResolvedRequestAuth` 允许 `ok: true` 而 `apiKey` 为 `undefined`（走 header 鉴权）。旧判定 `!auth.ok || !auth.apiKey` 会把这类 provider 当成鉴权失败，静默放弃自定摘要。现只看 `!auth.ok`。
 - 上述两项修正均由独立代码审查子代理提出，并已补充回归用例：把 `index.ts` 回滚到修正前，这 3 个用例确实失败（`3 failed | 58 passed`），修正后 61/61 通过。
 
@@ -128,7 +128,6 @@
 
 ---
 
-
 ## 修复
 
 ### 2026-05-31: 添加持久化存储，解决 resume 时数据为 0 的问题
@@ -154,6 +153,7 @@ function saveStats(stats: Stats) {
 ```
 
 **影响**:
+
 - 数据在 pi 重启后保持不变
 - resume 会话后数据不会丢失
 - 所有会话共享同一份统计数据
@@ -181,10 +181,12 @@ handler: async (_args, ctx) => {
 ```
 
 **影响**:
+
 - 在交互式模式下: `ctx.ui.notify` 正常工作
 - 在 `--print` 模式下: `console.log` 输出到 stdout
 
 **测试**:
+
 - 添加了新的单元测试验证 `console.log` 被调用
 - 所有 24 个测试全部通过
 
@@ -193,6 +195,7 @@ handler: async (_args, ctx) => {
 ### v0.1.0 (2026-05-31)
 
 **初始版本**:
+
 - P1 命中率遥测: 实时显示缓存命中率
 - P2 前缀守卫: 剥离易变区消息,保护缓存前缀
 - P3 缓存友好的 compaction: 用 v4-flash 做确定性摘要

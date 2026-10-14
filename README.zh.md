@@ -69,19 +69,19 @@ pi --model deepseek/deepseek-v4-flash
 
 ## 🧩 命令
 
-| 命令 | 说明 |
-|------|------|
+| 命令           | 说明                                                  |
+| -------------- | ----------------------------------------------------- |
 | `/cache-stats` | 弹窗显示命中率、缓存命中/未命中 token、轮次和预估节省 |
-| `/cache-graph` | 弹窗显示缓存命中率 ASCII 趋势图 |
-| `/cache-reset` | 重置所有统计、历史和摘要缓存（同时清除内存和磁盘） |
+| `/cache-graph` | 弹窗显示缓存命中率 ASCII 趋势图                       |
+| `/cache-reset` | 重置所有统计、历史和摘要缓存（同时清除内存和磁盘）    |
 
 ## 🔍 工作原理
 
-| 层 | 说明 | Harness 谱系 |
-|----|------|-------------|
-| **P1 — 遥测** | 在 `message_end` 事件中累计 `cacheRead` / `input` / `cacheWrite` / `turns` 与当前 `model`，原子持久化到 `~/.pi/agent/extensions/deepseek-cache/stats.json`；按官方价目表 + peak/off-peak 时段计价 | `TokenUsage` DISJOINT（`translate.ts:mapUsage`）—— `input = prompt_tokens - cacheRead` |
-| **P2 — 前缀守卫** | 在 `context` 中过滤 `volatile-scratch`；在 `before_provider_request` 中按字典序排序 `tools`；对 `system` + `tools` + `messages` 三段做稳定 JSON 指纹，与有界的已知前缀集合做包含检测 | `orderTools` / `sameSchema` / `canonicalHeader` / `headerEquals`（`packages/core/system-prompt`、`packages/core/session`） |
-| **P3 — Compaction** | 在 `session_before_compact` 时将历史序列化为单条 user 消息，用 `deepseek-flash`（含 legacy 名回退，temperature: 0）做摘要，SHA-256 缓存（LRU 64）并原子持久化 | **无 parity** —— Harness `compaction-basic/summarizer.ts` 会回放 `system+tools+shadowed messages` + 尾部指令以复用 warm 前缀；本路径是独立冷调用，取舍理由见 [§7.4](./docs/prefix-cache-principle.md) |
+| 层                  | 说明                                                                                                                                                                                              | Harness 谱系                                                                                                                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **P1 — 遥测**       | 在 `message_end` 事件中累计 `cacheRead` / `input` / `cacheWrite` / `turns` 与当前 `model`，原子持久化到 `~/.pi/agent/extensions/deepseek-cache/stats.json`；按官方价目表 + peak/off-peak 时段计价 | `TokenUsage` DISJOINT（`translate.ts:mapUsage`）—— `input = prompt_tokens - cacheRead`                                                                                                                |
+| **P2 — 前缀守卫**   | 在 `context` 中过滤 `volatile-scratch`；在 `before_provider_request` 中按字典序排序 `tools`；对 `system` + `tools` + `messages` 三段做稳定 JSON 指纹，与有界的已知前缀集合做包含检测              | `orderTools` / `sameSchema` / `canonicalHeader` / `headerEquals`（`packages/core/system-prompt`、`packages/core/session`）                                                                            |
+| **P3 — Compaction** | 在 `session_before_compact` 时将历史序列化为单条 user 消息，用 `deepseek-flash`（含 legacy 名回退，temperature: 0）做摘要，SHA-256 缓存（LRU 64）并原子持久化                                     | **无 parity** —— Harness `compaction-basic/summarizer.ts` 会回放 `system+tools+shadowed messages` + 尾部指令以复用 warm 前缀；本路径是独立冷调用，取舍理由见 [§7.4](./docs/prefix-cache-principle.md) |
 
 > 📖 深入原理：[前缀缓存原理](./docs/prefix-cache-principle.md) —— 官方 [Context Caching on Disk](https://api-docs.deepseek.com/guides/kv_cache)（基于 SWA 的独立 cache prefix unit、3 种落盘时机、best-effort）+ Harness 五重强制 + Pi 映射
 

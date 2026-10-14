@@ -37,7 +37,8 @@ const DEEPSEEK_PRICING: Record<string, PriceTier> = {
   // 官方注(1)：legacy 名 deepseek-v4-flash / deepseek-v4-flash-vision-exp 仍受理，
   // 但对应模型已退役，请求由 DeepSeek-V4.1-Flash 服务并按 Flash 价计费。
   "deepseek-v4-flash": FLASH_TIER,
-  "deepseek-v4-flash-vision-exp": FLASH_TIER,
+  // 注：legacy 名 deepseek-v4-flash-vision-exp 无需单列——lookupPricing 的
+  // startsWith 回退已把它归入 deepseek-v4-flash。
   // 官方 2026-09-10 变更日志：“In response to user demand, we have decided to
   // continue providing API services for DeepSeek V4 Pro after September 14, 2026,
   // with the billing method remaining unchanged.”
@@ -92,6 +93,9 @@ function isCstPublicHoliday(now: Date): boolean {
 function isPeakWindow(now: Date): boolean {
   const day = now.getUTCDay();
   if (day === 0 || day === 6) return false;
+  // 工作日用 UTC、假期用 UTC+8 自然日，两者口径混用在当前窗口（最早 01:00 UTC
+  // = 09:00 CST）下不会出现“UTC 是工作日但 CST 已跨到次日”的偏差；若官方将来
+  // 把窗口前移到 16:00 UTC 之后，需改为两者都按 CST 判定。
   if (isCstPublicHoliday(now)) return false;
   const hour = now.getUTCHours();
   return PEAK_HOURS_UTC.some(([start, end]) => hour >= start && hour < end);
@@ -832,6 +836,24 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", () => { flushPendingWrites(); });
 }
 
+/**
+ * 与 pi 自身的 getSummarizationFailure 同语义（未从包根导出，故内联）：
+ * "A length stop contains partial text and must not become a session checkpoint."
+ * error / length 两种 stopReason 都代表摘要不完整，不能被当作检查点。
+ */
+function getSummarizationFailure(
+  response: { stopReason?: string; errorMessage?: string },
+  label: string,
+): string | undefined {
+  if (response.stopReason === "error") {
+    return `${label} 失败：${response.errorMessage || "未知错误"}`;
+  }
+  if (response.stopReason === "length") {
+    return `${label} 失败：生成触达 token 上限，摘要不完整`;
+  }
+  return undefined;
+}
+
 async function summarizeWithFlash(
   text: string,
   ctx: ExtensionContext,
@@ -850,8 +872,8 @@ async function summarizeWithFlash(
   }
 
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok || !auth.apiKey) {
-    ctx.ui.notify("flash 摘要鉴权失败,回退默认 compaction", "warning");
+  if (!auth.ok) {
+    ctx.ui.notify(`flash 摘要鉴权失败（${auth.error}）,回退默认 compaction`, "warning");
     return;
   }
 
@@ -881,6 +903,17 @@ async function summarizeWithFlash(
       },
       { maxTokens: SUMMARY_MAX_TOKENS, temperature: 0, signal },
     );
+
+    // 截断/失败的摘要不得成为会话检查点。与 pi 自身的 getSummarizationFailure 同语义
+    // （pi: dist/core/compaction/compaction.js —— "A length stop contains partial text
+    // and must not become a session checkpoint."）。该函数未从包根导出，故在此内联。
+    // 重要：本扩展返回的摘要会被 pi 原文替换历史，并按输入哈希写进 summary-cache.json，
+    // 因此一次截断不但丢上下文，还会被缓存固化。
+    const failure = getSummarizationFailure(response, "flash 摘要");
+    if (failure) {
+      ctx.ui.notify(`${failure},回退默认 compaction`, "warning");
+      return;
+    }
 
     const summary = response.content
       .filter((c): c is { type: "text"; text: string } => c.type === "text")

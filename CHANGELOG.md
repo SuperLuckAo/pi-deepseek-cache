@@ -30,16 +30,22 @@
 
 - **`deepseek-v4-pro` 计价少算约 7 倍（严重）**：v0.3.0 依据 V4.1-Flash 发布公告中“自 2026-09-14 起 v4-pro 请求全部路由至 V4.1-Flash 并按 Flash 价结算”的表述，把 v4-pro 映射到 Flash 价。但该计划**已被官方撤销**：官方变更日志在 **2026-09-10**（即原定切换日之前）声明 *“we have decided to continue providing API services for DeepSeek V4 Pro after September 14, 2026, with the billing method remaining unchanged.”*。官方价目表也一直列着 v4-pro 自身价（命中 0.044 / 未命中 1.32 峰值，模型版本 DeepSeek-V4-Pro-0813），pi 自身的模型目录同样是 `cacheRead 0.044 / input 1.32`。现改回官方价目表：命中价少算约 7.3 倍（0.044 / 0.006）、未命中价少算约 4.4 倍（1.32 / 0.30）的问题已修正。
 - **峰值时段未排除中国公共假期**：官方注(2) 定义峰值为 01:00-04:00 / 06:00-10:00 UTC 的周一至五，**并排除中国公共假期**（全部节假日与周末均为谷值）。旧实现只按 UTC 工作日判断，在中国法定假期的上述窗口内会把谷值当峰值，**高估**节省额一倍。现按国内官方节假日安排（国办发明电〔2025〕7号）以 UTC+8 自然日判定并排除；未收录年份不匹配任何区间，退化为旧行为（只会保守高估，不会静默低估）。
-- **legacy 名 `deepseek-v4-flash-vision-exp` 未映射**：官方注(1) 列明它与 `deepseek-v4-flash` 一样仍被受理、由 V4.1-Flash 服务并按 Flash 价计费。已补上映射（原先会落到未知模型保守下界）。
+- **legacy 名 `deepseek-v4-flash-vision-exp` 无需新增映射（复核后修正）**：该名字原本已被 `lookupPricing` 的 `startsWith` 回退归入 `deepseek-v4-flash`，取价正确。真正的问题是这层回退行为未被文档化，已补注释，并移除一个永远不会被命中的冗余键。
+
+### 修复：摘要可信度
+
+- **截断的摘要会被当成检查点（严重，接受代码审查建议）**：`summarizeWithFlash` 从未检查 `stopReason`。官方 pi-ai 把 `finish_reason: "length"` 映射为 `stopReason: "length"` 并照常 resolve，且 error 路径保留已生成的局部 `content`。已生成的局部摘要会被 pi **原文替换历史**，并按输入哈希写进 `summary-cache.json`——一次截断不但丢上下文，还会被缓存固化。pi 自身明确拒绝该情形（`dist/core/compaction/compaction.js`：*“A length stop contains partial text and must not become a session checkpoint.”*）。现内联同语义判定（该函数未从包根导出），遇 `error` / `length` 告警并回退默认 compaction。
+- **鉴权预检会误判纯 headers/OAuth 类 provider**：官方 `ResolvedRequestAuth` 允许 `ok: true` 而 `apiKey` 为 `undefined`（走 header 鉴权）。旧判定 `!auth.ok || !auth.apiKey` 会把这类 provider 当成鉴权失败，静默放弃自定摘要。现只看 `!auth.ok`。
+- 上述两项修正均由独立代码审查子代理提出，并已补充回归用例：把 `index.ts` 回滚到修正前，这 3 个用例确实失败（`3 failed | 58 passed`），修正后 61/61 通过。
 
 ### 其它
 
-- `devDependencies` 的 pi 包从 `^0.84.2` 升到 `^1.2.0`：此前 CI 校验的是两年前的宿主类型，而用户实际运行的是 1.2.x，这也是上述宿主 API 失配长期未被发现的原因。
-- 同步更新 `docs/prefix-cache-principle.md` §4.3（v4-pro 价目表与假期规则），并新增覆盖 Pro 价、假期时段、未收录年份、谷值折半的测试用例。
+- `devDependencies` 的 pi 包从 `^0.84.2` 升到 `^1.2.0`。需说明的是：`tsc` 的 4 个错误**并非**这次升版引入——在 `main` 自己的 lockfile（锁定 0.84.2）上同样存在，根因是 pi-ai 1.x 起根入口不再导出 `complete`。升到 1.2.0 是为了让 CI 校验用户实际运行的宿主版本。
+- 同步更新 `docs/prefix-cache-principle.md` §4.3（v4-pro 价目表与假期规则）与全部 `index.ts:NNN` 行号引用，并新增覆盖 Pro 价、假期时段、未收录年份、谷值折半、摘要截断护栏与 headers-only 鉴权的测试（52 → 61）。
 
 ### 待处理（不在本次变更范围）
 
-- `main` 的 CI 自 v0.3.0 推送起一直是红的，卡在 `npm run lint`：`tests/` 下有 27 个 `@typescript-eslint/no-explicit-any` / `no-unsafe-function-type` 错误，另有 11 个文件未过 `prettier --check`。因为 lint 先失败，`tsc` 与 `vitest` 这段时间实际上没有把关——本次的宿主 API 失配正是因此没被拦住。
+- `main` 的 CI 已经**很久没有绿过**：查 `.github/workflows/ci.yml` 的全部历史运行，v0.2.0、v0.2.1、v0.3.0 三次 main 推送全部在 `test -> Lint` 步骤失败（另有最早一次失败在 `setup-node`）。失败内容是 `tests/` 下的 27 个 `@typescript-eslint/no-explicit-any` / `no-unsafe-function-type` 错误，以及 11 个文件未过 `prettier --check`。因为 lint 先失败，`tsc` 与 `vitest` 长期实际上没有把关——这也是上述四项问题（宿主 API 失配、既有类型错误、v4-pro 计价、摘要截断）能长期潜伏的直接原因。需单独一次修复（已在后续提交中处理）。
 
 ## v0.3.0 (2026-09-29): 对齐官方现行口径复查
 

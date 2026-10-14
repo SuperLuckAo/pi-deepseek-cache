@@ -84,7 +84,7 @@ describe("pi-deepseek-cache 集成测试", () => {
             cwd: PROJECT_ROOT,
             timeout: 30000,
             env: { ...process.env },
-          }
+          },
         );
 
         // 检查是否有加载错误
@@ -112,7 +112,7 @@ describe("pi-deepseek-cache 集成测试", () => {
             cwd: PROJECT_ROOT,
             timeout: 30000,
             env: { ...process.env },
-          }
+          },
         );
 
         const output = stdout + stderr;

@@ -4,7 +4,7 @@
 
 **Squeeze the most out of DeepSeek's context caching inside the [Pi](https://pi.dev) coding agent.**
 
-Stable prompt prefixes · higher cache-hit rates · live cache stats — so long sessions pay the *cache-hit* rate on most of their input.
+Stable prompt prefixes · higher cache-hit rates · live cache stats — so long sessions pay the _cache-hit_ rate on most of their input.
 
 [![npm version](https://img.shields.io/npm/v/pi-deepseek-cache.svg)](https://www.npmjs.com/package/pi-deepseek-cache)
 [![npm downloads](https://img.shields.io/npm/dm/pi-deepseek-cache.svg)](https://www.npmjs.com/package/pi-deepseek-cache)
@@ -18,7 +18,7 @@ Stable prompt prefixes · higher cache-hit rates · live cache stats — so long
 
 ## ✨ Why this exists
 
-DeepSeek's API has **Context Caching on Disk** built in: any request whose prompt **prefix** fully matches a previously persisted cache prefix unit is billed at the much cheaper *cache-hit* rate. The catch — your prompt prefixes must stay **stable across turns**, token-for-token.
+DeepSeek's API has **Context Caching on Disk** built in: any request whose prompt **prefix** fully matches a previously persisted cache prefix unit is billed at the much cheaper _cache-hit_ rate. The catch — your prompt prefixes must stay **stable across turns**, token-for-token.
 
 In long agent sessions that's surprisingly hard:
 
@@ -37,7 +37,7 @@ In long agent sessions that's surprisingly hard:
 - **Hit Rate Telemetry** — accumulates `cacheRead` / `input` / `cacheWrite` / `turns` from every response and persists to disk
 - **Live Status Bar** — see cumulative hit rate and turn count in the Pi footer after every message
 - **ASCII Trend Chart** — visualize cache hit rate over time with `/cache-graph` (flat-rate handling + fixed chart labels)
-- **Cost Savings Estimation** — savings priced from the official [Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing) table for the *active* model, with peak/off-peak time-of-day rates; `/cache-stats` shows both cumulative and per-request hit rates, the model, the current window, and the unit prices used
+- **Cost Savings Estimation** — savings priced from the official [Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing) table for the _active_ model, with peak/off-peak time-of-day rates; `/cache-stats` shows both cumulative and per-request hit rates, the model, the current window, and the unit prices used
 - **Cache-Friendly Compaction** — summarizes with `deepseek-flash` at temperature 0 (falls back to the legacy `deepseek-v4-flash` name), with SHA-256–cached results persisted across sessions (LRU capped at 64). Note: this is a standalone cold call, **not** a verbatim replay of the routed request — see [§7.4](./docs/prefix-cache-principle.md)
 - **Atomic Persistence** — `tmp + rename` writes + debounced async flush + `session_start`/`session_shutdown` lifecycle guarantees, no torn JSON
 - **`/cache-reset`** — clear all stats, history, and summary cache with one command
@@ -69,19 +69,19 @@ pi --model deepseek/deepseek-v4-flash
 
 ## 🧩 Commands
 
-| Command | Description |
-|---------|-------------|
+| Command        | Description                                                                     |
+| -------------- | ------------------------------------------------------------------------------- |
 | `/cache-stats` | Overlay popup with hit rate, cached/missed tokens, turns, and estimated savings |
-| `/cache-graph` | Overlay popup with ASCII trend chart of cache hit rate over time |
-| `/cache-reset` | Reset all stats, history, and summary cache (clears both memory and disk) |
+| `/cache-graph` | Overlay popup with ASCII trend chart of cache hit rate over time                |
+| `/cache-reset` | Reset all stats, history, and summary cache (clears both memory and disk)       |
 
 ## 🔍 How it works
 
-| Layer | What it does | Harness lineage |
-|-------|-------------|-----------------|
-| **P1 — Telemetry** | Accumulates `cacheRead` / `input` / `cacheWrite` / `turns` from `message_end` events plus the active `model`, persists atomically to `~/.pi/agent/extensions/deepseek-cache/stats.json`; prices savings per official table + peak/off-peak window | `TokenUsage` DISJOINT (`translate.ts:mapUsage`) — `input = prompt_tokens - cacheRead` |
-| **P2 — Prefix Guard** | Filters `volatile-scratch` in `context`; sorts `tools` lexicographically in `before_provider_request`; fingerprints `system` + `tools` + `messages` with stable-JSON + inclusion check against a bounded set of known prefixes | `orderTools` / `sameSchema` / `canonicalHeader` / `headerEquals` (`packages/core/system-prompt`, `packages/core/session`) |
-| **P3 — Compaction** | On `session_before_compact`, summarizes history as a single user message with `deepseek-flash` (legacy name fallback) at temperature 0. Summaries are SHA-256–cached (LRU 64) and atomically persisted | **No parity** — Harness `compaction-basic/summarizer.ts` replays `system+tools+shadowed messages` + trailing instruction to reuse a warm prefix; this path is a standalone cold call. Rationale in [§7.4](./docs/prefix-cache-principle.md) |
+| Layer                 | What it does                                                                                                                                                                                                                                      | Harness lineage                                                                                                                                                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **P1 — Telemetry**    | Accumulates `cacheRead` / `input` / `cacheWrite` / `turns` from `message_end` events plus the active `model`, persists atomically to `~/.pi/agent/extensions/deepseek-cache/stats.json`; prices savings per official table + peak/off-peak window | `TokenUsage` DISJOINT (`translate.ts:mapUsage`) — `input = prompt_tokens - cacheRead`                                                                                                                                                       |
+| **P2 — Prefix Guard** | Filters `volatile-scratch` in `context`; sorts `tools` lexicographically in `before_provider_request`; fingerprints `system` + `tools` + `messages` with stable-JSON + inclusion check against a bounded set of known prefixes                    | `orderTools` / `sameSchema` / `canonicalHeader` / `headerEquals` (`packages/core/system-prompt`, `packages/core/session`)                                                                                                                   |
+| **P3 — Compaction**   | On `session_before_compact`, summarizes history as a single user message with `deepseek-flash` (legacy name fallback) at temperature 0. Summaries are SHA-256–cached (LRU 64) and atomically persisted                                            | **No parity** — Harness `compaction-basic/summarizer.ts` replays `system+tools+shadowed messages` + trailing instruction to reuse a warm prefix; this path is a standalone cold call. Rationale in [§7.4](./docs/prefix-cache-principle.md) |
 
 > 📖 Deep dive: [Prefix Cache Principle](./docs/prefix-cache-principle.md) — official [Context Caching on Disk](https://api-docs.deepseek.com/guides/kv_cache) (SWA-based independent cache prefix units, 3 persistence timings, best-effort) + Harness 5-layer enforcement + Pi mapping
 

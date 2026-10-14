@@ -2,7 +2,14 @@ import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-c
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { matchesKey, visibleWidth, type Focusable } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  unlinkSync,
+  renameSync,
+} from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -340,7 +347,10 @@ function loadSummaryCache(): Map<string, string> {
   } catch (err) {
     if (extensionCtx) {
       const msg = err instanceof Error ? err.message : String(err);
-      extensionCtx.ui.notify(`[deepseek-cache] summary-cache.json 解析失败 (${msg}),已重置`, "warning");
+      extensionCtx.ui.notify(
+        `[deepseek-cache] summary-cache.json 解析失败 (${msg}),已重置`,
+        "warning",
+      );
     }
   }
   return new Map();
@@ -399,9 +409,8 @@ class CacheStatsOverlay implements Focusable {
     // flash 档单价低（谷值 hit $0.003 / miss $0.15），每百万命中仅省 $0.147，
     // 固定 2 位小数会丢失有效信息，故小额用 4 位、大额用 2 位
     const savedDollars = (cacheRead / 1_000_000) * (pricing.miss - pricing.hit);
-    const savedStr = savedDollars >= 0.01
-      ? `$${savedDollars.toFixed(savedDollars < 1 ? 4 : 2)}`
-      : "< $0.01";
+    const savedStr =
+      savedDollars >= 0.01 ? `$${savedDollars.toFixed(savedDollars < 1 ? 4 : 2)}` : "< $0.01";
 
     const pad = (s: string) => s + " ".repeat(Math.max(0, inner - visibleWidth(s)));
     const row = (s: string) => th.fg("border", "│") + pad(s) + th.fg("border", "│");
@@ -416,12 +425,15 @@ class CacheStatsOverlay implements Focusable {
       row(` ${th.fg("accent", "⚡ DeepSeek 缓存统计")}`),
       row(""),
       row(label("累计命中率", `${cumulative.toFixed(1)}%`)),
-      row(label("本轮命中率", lastTurnHitRate === undefined ? "—" : `${lastTurnHitRate.toFixed(1)}%`)),
+      row(
+        label("本轮命中率", lastTurnHitRate === undefined ? "—" : `${lastTurnHitRate.toFixed(1)}%`),
+      ),
       row(label("缓存命中", `${cacheRead.toLocaleString()} tokens`)),
       row(label("缓存未命中", `${input.toLocaleString()} tokens`)),
     ];
     // 官方 usage 仅提供 hit/miss，无 cache write 字段；未观测到写入时隐藏该行
-    if (reportsCacheWrite) lines.push(row(label("缓存写入", `${cacheWrite.toLocaleString()} tokens`)));
+    if (reportsCacheWrite)
+      lines.push(row(label("缓存写入", `${cacheWrite.toLocaleString()} tokens`)));
     lines.push(
       row(label("对话轮次", `${turns}`)),
       row(label("预估节省", savedStr)),
@@ -589,15 +601,16 @@ class CacheGraphOverlay implements Focusable {
 export default function (pi: ExtensionAPI) {
   // Store ctx for persistence error reporting (R7)
   // Will be set on first event that provides ctx
-  const setExtensionCtx = (ctx: ExtensionContext) => { extensionCtx = ctx; };
+  const setExtensionCtx = (ctx: ExtensionContext) => {
+    extensionCtx = ctx;
+  };
 
   // ───────── P1 命中率遥测(持久化) ─────────
   const persisted = loadStats();
   let { cacheRead, input, cacheWrite, turns } = persisted;
   const hitRateHistory = loadHistory();
-  let lastHitRate = hitRateHistory.length > 0
-    ? hitRateHistory[hitRateHistory.length - 1].hitRate
-    : 0;
+  let lastHitRate =
+    hitRateHistory.length > 0 ? hitRateHistory[hitRateHistory.length - 1].hitRate : 0;
   /** 最近一轮的 hit/miss，用于展示按请求口径的命中率（官方逐次统计口径） */
   let lastTurn: { read: number; miss: number } | undefined;
   /** 当前 wire model，用于按官方价目表选价 */
@@ -615,8 +628,7 @@ export default function (pi: ExtensionAPI) {
   const MAX_KNOWN_PREFIXES = 8;
 
   /** R2: 单一命中率计算函数 */
-  const calcHitRate = (r: number, i: number): number =>
-    (r + i) ? (r / (r + i)) * 100 : 0;
+  const calcHitRate = (r: number, i: number): number => (r + i ? (r / (r + i)) * 100 : 0);
 
   pi.on("message_end", async (event, ctx) => {
     setExtensionCtx(ctx);
@@ -673,8 +685,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       setExtensionCtx(ctx);
       await ctx.ui.custom<void>(
-        (_tui, theme, _kb, done) =>
-          new CacheStatsOverlay(theme, buildStatsView(), done),
+        (_tui, theme, _kb, done) => new CacheStatsOverlay(theme, buildStatsView(), done),
         { overlay: true },
       );
     },
@@ -686,8 +697,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       setExtensionCtx(ctx);
       await ctx.ui.custom<void>(
-        (_tui, theme, _kb, done) =>
-          new CacheGraphOverlay(theme, hitRateHistory, done),
+        (_tui, theme, _kb, done) => new CacheGraphOverlay(theme, hitRateHistory, done),
         { overlay: true },
       );
     },
@@ -832,10 +842,19 @@ export default function (pi: ExtensionAPI) {
 
   // 会话生命周期：切换/新会话时重置前缀指纹，避免旧会话哈希残留导致跨会话假阳性告警；
   // 退出时强制 flush（api-docs kv_cache best-effort 资源清理类比）
-  const resetPrefixFingerprint = () => { knownPrefixes.length = 0; };
-  pi.on("session_start", (_event, ctx) => { extensionCtx = ctx; resetPrefixFingerprint(); });
-  pi.on("session_before_switch", () => { resetPrefixFingerprint(); });
-  pi.on("session_shutdown", () => { flushPendingWrites(); });
+  const resetPrefixFingerprint = () => {
+    knownPrefixes.length = 0;
+  };
+  pi.on("session_start", (_event, ctx) => {
+    extensionCtx = ctx;
+    resetPrefixFingerprint();
+  });
+  pi.on("session_before_switch", () => {
+    resetPrefixFingerprint();
+  });
+  pi.on("session_shutdown", () => {
+    flushPendingWrites();
+  });
 }
 
 /**
@@ -869,7 +888,10 @@ async function summarizeWithFlash(
     if (model) break;
   }
   if (!model) {
-    ctx.ui.notify(`找不到摘要模型（${SUMMARIZER_CANDIDATES.join(" / ")}）,回退默认 compaction`, "warning");
+    ctx.ui.notify(
+      `找不到摘要模型（${SUMMARIZER_CANDIDATES.join(" / ")}）,回退默认 compaction`,
+      "warning",
+    );
     return;
   }
 

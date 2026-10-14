@@ -263,20 +263,27 @@ export function mapUsage(usage: WireUsage): TokenUsage {
   | `deepseek-flash`（= DeepSeek-V4.1-Flash） | 0.006 | 0.003 | 0.30 | 0.15 |
   | `deepseek-v4-pro` | 0.044 | 0.022 | 1.32 | 0.66 |
 
-  峰值为 01:00-04:00 / 06:00-10:00 UTC 周一至五（官方注(2) 另排除中国公共假期），其余为谷值 = 峰值 / 2。
+  峰值为 01:00-04:00 / 06:00-10:00 UTC 周一至五，**并排除中国公共假期**（官方注(2)），其余为谷值 = 峰值 / 2。
 
-- ⚠️ **但 v4-pro 行已不适用于实际结算**：官方公告 [Introducing DeepSeek-V4.1-Flash](https://www.deepseek.com/en/news/deepseek-v4-1-flash/) 明确 ——
+- ✅ **v4-pro 仍按自身价目表结算**（2026-09-10 更正）：
+
+  v0.3.0 曾依据 [Introducing DeepSeek-V4.1-Flash](https://www.deepseek.com/en/news/deepseek-v4-1-flash/) 的以下表述，把 `deepseek-v4-pro` 按 Flash 价计费：
 
   > Starting at 04:00 UTC on Sept 14, 2026, all deepseek-v4-pro requests will route to V4.1-Flash at V4.1-Flash rates. This will continue until V4.1-Pro launches.
 
-  即自 2026-09-14 起，`deepseek-v4-pro` 的请求实际由 V4.1-Flash 服务并按 **Flash 价**结算；pricing 页面的 v4-pro 列是尚未下线的历史价。本扩展统计的是实际结算额，故**按公告口径取 Flash 价**，V4.1-Pro 上线后需单独加价。
+  但该计划**已被官方撤销**。官方 [Change Log](https://api-docs.deepseek.com/updates) 在 **2026-09-10**（即原定切换日 09-14 之前）写明：
 
-- 官方注(1)：legacy 名 `deepseek-v4-flash` 仍受理，但模型已退役，请求由 DeepSeek-V4.1-Flash 服务并按 Flash 价计费。
+  > In response to user demand, we have decided to continue providing API services for DeepSeek V4 Pro after September 14, 2026, with the billing method remaining unchanged.
+
+  即 `deepseek-v4-pro` **从未实际切换**到 Flash 价，继续按上表 v4-pro 行结算（模型版本 DeepSeek-V4-Pro-0813）。因此 "按 Flash 价结算" 会把 v4-pro 用户的节省额**少算约 7 倍**（1.32 / 0.30 ≈ 4.4 倍未命中价、0.044 / 0.006 ≈ 7.3 倍命中价），现已改回官方价目表。pi 自身的模型目录 `@earendil-works/pi-ai/providers/data/deepseek.json` 同样是 `cacheRead 0.044 / input 1.32`，与此一致。
+
+- 官方注(1)：legacy 名 `deepseek-v4-flash` 与 `deepseek-v4-flash-vision-exp` 仍受理，但对应模型已退役，请求由 DeepSeek-V4.1-Flash 服务并按 Flash 价计费。
 - 官方已于 **2026-07-24** 停用 `deepseek-chat` / `deepseek-reasoner`（二者从未是独立模型，只是 `deepseek-v4-flash` 的思考 / 非思考模式别名）；本项目保留同价映射仅供旧会话与自建代理兜底。
 
-- **本项目实现**（`index.ts` `DEEPSEEK_PRICING` / `isPeakWindow` / `currentPricing`）：
+- **本项目实现**（`index.ts` `DEEPSEEK_PRICING` / `CN_PUBLIC_HOLIDAYS` / `isPeakWindow` / `currentPricing`）：
   - 按当前 wire model 选价目表，未知模型取保守下界（flash 谷值）而非高估；
   - 按调用时刻判断 peak / off-peak，谷值自动减半；
+  - 峰值窗口排除中国公共假期（按 UTC+8 自然日判定，数据源见 `CN_PUBLIC_HOLIDAYS` 注释；未收录年份退化为"不排除假期"，只会保守地高估而非低估峰值）；
   - `saved = cacheRead / 1e6 * (miss − hit)`；
   - `/cache-stats` 同时展示当前模型、时段与单价，避免黑盒数字。
 
@@ -409,17 +416,19 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 
 | Pi 钩子 | 触发时机 | 复刻的 Harness 手段 | 本项目做法 |
 |---------|----------|---------------------|------------|
-| context | 每次组装上下文、即将并入请求前 | 固定 System Prompt 的易变内容后置与 append-only | 过滤 customType volatile-scratch 的易变消息，使其不进入 wire 前缀（index.ts:687 pi.on(context, ...)），避免时间戳/草稿截断稳定前缀 |
+| context | 每次组装上下文、即将并入请求前 | 固定 System Prompt 的易变内容后置与 append-only | 过滤 customType volatile-scratch 的易变消息，使其不进入 wire 前缀（index.ts:722 pi.on(context, ...)），避免时间戳/草稿截断稳定前缀 |
 | before_provider_request | provider payload 已组装、尚未发送 | 工具字典序 + Wire 确定性序列化 + 请求头折叠的发送前最后一致性门 | 见 7.2 |
 | session_before_compact | 压缩前，允许扩展接管总结 | Compaction verbatim 回放（**未对齐**，见 7.4） | 以 `deepseek-flash`（兼容 legacy 名 `deepseek-v4-flash`）@ temperature 0 做确定性总结，结果按 SHA-256 去重并落盘 summary-cache.json |
 
 #### context — 易变内容隔离
 
 ```ts
-// index.ts:687
+// index.ts:722
 pi.on("context", async (event, ctx) => {
-  const msgs = Array.isArray((event as any).messages) ? (event.messages as CachedMessage[]) : [];
-  const onWire = msgs.filter((m) => m?.customType !== "volatile-scratch");
+  if (!Array.isArray(event.messages)) return undefined;
+  const onWire = event.messages.filter(
+    (m) => (m as unknown as { customType?: unknown }).customType !== "volatile-scratch",
+  );
   return { messages: onWire };
 });
 ```
@@ -429,7 +438,7 @@ pi.on("context", async (event, ctx) => {
 #### before_provider_request — 发送前一致性门
 
 ```ts
-// index.ts:698 — 节选
+// index.ts:738 — 节选
 pi.on("before_provider_request", (event, ctx) => {
   const payload = event.payload as Record<string, unknown>;
   if (Array.isArray(payload.tools) && payload.tools.length > 1) {
@@ -456,7 +465,7 @@ pi.on("before_provider_request", (event, ctx) => {
 #### session_before_compact — 缓存友好的确定性总结
 
 ```ts
-// index.ts:754
+// index.ts:794
 pi.on("session_before_compact", async (event, ctx) => {
   flushPendingWrites();
   const { messagesToSummarize, firstKeptEntryId, tokensBefore, previousSummary } = event.preparation;
@@ -495,7 +504,7 @@ pi.on("session_before_compact", async (event, ctx) => {
 ### 7.2 本项目新增的三个强制点
 
 - **问题**：Pi 侧不同扩展注册工具的顺序不确定；若直接透传，wire 字节在 tools 段即分叉。
-- **做法**：在 before_provider_request 中对 payload.tools 按 getToolName 的码点字典序排序，仅在顺序确实改变时以 `{...payload, tools: sorted}` 非破坏性返回替换（index.ts:698）。
+- **做法**：在 before_provider_request 中对 payload.tools 按 getToolName 的码点字典序排序，仅在顺序确实改变时以 `{...payload, tools: sorted}` 非破坏性返回替换（index.ts:738）。
 - **与 Harness 一致性**：与 dsh-system-prompt/lib/index.js:44 orderTools 的回退分支语义一致（未配置 toolOrder 时按 compareToolNames 排序）；Pi 侧同样使用码点比较（localeCompare 依赖 ICU/locale，跨环境可能不同序，已弃用）。
 - **可观测**：排序先于指纹计算，诊断基于归一化后的字节。
 
@@ -503,15 +512,18 @@ pi.on("session_before_compact", async (event, ctx) => {
 
 - **问题**：官方要求完整匹配已持久化的 cache prefix unit，但开发期更关心本轮请求是否仍是上一轮的追加——非追加即可能 miss。
 - **覆盖面（重要）**：指纹必须同时覆盖 `system`、`tools`、`messages` 三段。pi-ai 的 `openai-completions` `buildParams` 把 `system` 并入 `messages`，但 **`tools` 是独立顶层字段**；早期实现只哈希 `messages`，导致工具增删或 schema 变更击穿缓存时零告警。现已对 `tools` 单独取 `stableStringify` + SHA-256 并纳入比对。
-- **做法**：对完整 messages 列表（含最后一条，对齐官方 cache unit 落盘边界——用户输入末尾）与归一化后的 tools 分别做 stableStringify + SHA-256，组成 `PrefixFingerprint { tools, messages, len }`；本轮为追加式 = 消息列表以某个已知指纹开头**且 tools 指纹未变**，否则 `prefixBreaks++` 并 `ctx.ui.notify` 告警（index.ts:698）。
+- **做法**：对完整 messages 列表（含最后一条，对齐官方 cache unit 落盘边界——用户输入末尾）与归一化后的 tools 分别做 stableStringify + SHA-256，组成 `PrefixFingerprint { tools, messages, len }`；本轮为追加式 = 消息列表以某个已知指纹开头**且 tools 指纹未变**，否则 `prefixBreaks++` 并 `ctx.ui.notify` 告警（index.ts:778）。
 - **多指纹集合**：官方 unit 独立完整、可并存，且未使用的条目数小时至数日内才清理。因此判定“是否破坏前缀”不能只看上一轮——回落到早期已落盘前缀仍是有效命中（官方 Example 2）。实现保留有界集合（`MAX_KNOWN_PREFIXES = 8`），命中任一即视为追加式。
 - **与 Harness 一致性**：Harness 以 foldRequestHeader + headerEquals 判断 envelope 是否变化，以 session.deriveMessages() 重建历史；本项目在 wire 侧以哈希等价实现前缀包含检测，二者互补——前者保 envelope（含 system/tools），后者保 messages 前缀的追加性。
-- **序列化稳定性**：使用 stableStringify（键按字典序排序，数组保持原序，递归稳定）避免同一语义因键序抖动而误报 break（index.ts:126）。
+- **序列化稳定性**：使用 stableStringify（键按字典序排序，数组保持原序，递归稳定）避免同一语义因键序抖动而误报 break（index.ts:161）。
+- **哈希对象是 wire payload 而非重建历史**：指纹直接哈希即将发送的 `payload.messages`，因此凡是会影响前缀的字段（包括 pi 按 `requiresReasoningContentOnAssistantMessages` 回放的 `reasoning_content`、`content` 数组形态的图片块等）无需特例即被覆盖。两端边界需知情：
+  - 官方 [Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode)：携带 `tools` 时历史 `reasoning_content` 会拼接进上下文（因此变动它就是真实击穿，告警正确）；不携带 `tools` 时它被忽略，此时因它变动而告警属误报。pi 的模型目录对两个 DeepSeek 模型都标为 `requiresReasoningContentOnAssistantMessages: true`，且 pi 恒发工具，故实际不会命中误报分支。
+  - `user_id` 是官方文档明列的 KVCache 隔离维度（[Rate Limit & Isolation](https://api-docs.deepseek.com/quick_start/rate_limit)），但 pi 不发送该字段，因此本扩展未将其纳入指纹；若将来 pi 开始发送按会话轮换的 `user_id`，需同步加入，否则会出现“前缀完全一致但命中率骤降”的哑否。
 
 #### 3. 原子落盘（Atomic Persistence）
 
 - **问题**：统计与摘要缓存若以非原子写落盘，崩溃时可能产生半截 JSON，导致下次启动误判或丢失命中归因。
-- **做法**：atomicWriteJson 先写入 path.pid.tmp，再 renameSync 原子替换（index.ts:147）；所有持久化（stats.json / summary-cache.json / hitRateHistory）均经此路径，配合 session_shutdown 与 session_before_compact 前的 flushPendingWrites()，保证退出必 flush与压缩前必 flush。
+- **做法**：atomicWriteJson 先写入 path.pid.tmp，再 renameSync 原子替换（index.ts:182）；所有持久化（stats.json / summary-cache.json / hitRateHistory）均经此路径，配合 session_shutdown 与 session_before_compact 前的 flushPendingWrites()，保证退出必 flush与压缩前必 flush。
 - **与 Harness 一致性**：Harness 会话存储（JSONL/SQLite）亦保证 Persistence does not mutate live request prefixes 且修复结果 append 而非重写；本项目在扩展侧以原子文件语义延续同一不变量。
 
 ### 7.3 遥测与可视化（P1）
@@ -552,13 +564,15 @@ pi.on("session_before_compact", async (event, ctx) => {
   - node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js:212,267,280,294 — COMPACTION_INSTRUCTION / summarizeWithLlm verbatim 回放
 
 - **本项目**
-  - index.ts:126 — stableStringify 字节稳定序列化
-  - index.ts:147 — atomicWriteJson 原子落盘
-  - index.ts:33 — DEEPSEEK_PRICING 官方价目表（含 peak/off-peak 与 legacy 名）
-  - index.ts:687 — context 易变隔离
-  - index.ts:698 — before_provider_request 工具排序 + system/tools/messages 三段前缀指纹
-  - index.ts:754 — session_before_compact 确定性总结与摘要缓存
-  - index.ts:795 — summarizeWithFlash 独立冷调用（非 verbatim 回放，见 7.4）
+  - index.ts:161 — stableStringify 字节稳定序列化
+  - index.ts:182 — atomicWriteJson 原子落盘
+  - index.ts:34 — DEEPSEEK_PRICING 官方价目表（含 peak/off-peak、v4-pro 独立价与 legacy 名）
+  - index.ts:75 — CN_PUBLIC_HOLIDAYS 中国公共假期（峰值窗口排除）
+  - index.ts:92 — isPeakWindow 峰值/谷值判定
+  - index.ts:722 — context 易变隔离
+  - index.ts:738 — before_provider_request 工具排序 + system/tools/messages 三段前缀指纹
+  - index.ts:794 — session_before_compact 确定性总结与摘要缓存
+  - index.ts:835 — summarizeWithFlash 独立冷调用（非 verbatim 回放，见 7.4）
   - README.md — 功能总览与 [DeepSeek Context Caching docs](https://api-docs.deepseek.com/guides/kv_cache) 入口
 
 ---

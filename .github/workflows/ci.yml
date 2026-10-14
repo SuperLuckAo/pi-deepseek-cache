@@ -12,9 +12,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # pi 1.2.x declares engines.node ">=22.19.0" and its dist imports
+      # fs.globSync (Node 22.14+), so Node 20 fails with
+      # "does not provide an export named 'globSync'" as soon as the
+      # extension imports @earendil-works/pi-coding-agent.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - run: npm ci

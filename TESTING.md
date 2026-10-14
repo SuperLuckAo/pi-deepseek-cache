@@ -6,11 +6,14 @@
 
 ### 测试套件
 
+> 开发环境要求 **Node.js >= 22.19.0**：pi 1.2.x 的 `engines.node` 为 `>=22.19.0`，且其 dist 使用 `fs.globSync`（Node 22.14+）。用 Node 20 运行测试会报
+> `SyntaxError: The requested module 'node:fs' does not provide an export named 'globSync'`。CI 因此使用 Node 22。
+
 | 测试文件                    | 测试数量 | 说明                             |
 | --------------------------- | -------- | -------------------------------- |
-| `tests/index.test.ts`       | 14       | 单元测试: P1/P2/P3 功能测试      |
+| `tests/index.test.ts`       | 51       | 单元测试: P1/P2/P3 功能测试      |
 | `tests/integration.test.ts` | 10       | 集成测试: 扩展文件检查、加载测试 |
-| **总计**                    | **24**   | **全部通过**                     |
+| **总计**                    | **61**   | **全部通过**                     |
 
 ## 测试结果
 

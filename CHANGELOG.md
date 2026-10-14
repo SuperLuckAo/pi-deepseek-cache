@@ -43,6 +43,7 @@
 - **背景**：查 `.github/workflows/ci.yml` 的全部历史运行，v0.2.0、v0.2.1、v0.3.0 三次 main 推送**全部**在 `test -> Lint` 步骤失败（另有最早一次失败在 `setup-node`）。因为 `npm run lint` = `eslint . && prettier --check .` 先失败，`tsc` 与 `vitest` 长期以来实际上没有把关——这正是本版本上述问题（既有类型错误、宿主 API 失配、v4-pro 计价、摘要截断）能潜伏至今的直接原因。
 - **eslint**：`index.ts` 里 2 个**既有**错误已修（`no-useless-assignment` 的死初始化；`no-empty` 的空 catch 改为写明为何可以吞掉）；`tests/**` 下 30 余个 `no-explicit-any` / `no-unsafe-function-type` 通过在 eslint 配置里**仅对测试目录**关闭这两条规则解决——测试替身刻意宽松，断言目标是行为而非形状，源码 `index.ts` 保持严格。修复后 `eslint .` 报告 **0 errors**（保留 4 个 warning，少于 main）。
 - **prettier**：11 个已纳入版本管理的文件从未被格式化过（含 `index.ts` 与全部文档），已整体执行一次 `prettier --write .`，**单独一个 commit**（无行为变化）以免混淆真实改动。
+- **CI 的 Node 版本原本不受支持**：workflow 固定 Node 20，而 pi 1.2.x 的 `engines.node` 为 `>=22.19.0`，其 dist 还使用了 `fs.globSync`（Node 22.14+）。一旦把 pi 1.2.0 装进 devDependencies，`vitest` 导入 `@earendil-works/pi-coding-agent` 就报 `The requested module 'node:fs' does not provide an export named 'globSync'`。已改为 Node 22，并在 workflow 与 `TESTING.md` 中写明原因。这个问题同样是“lint 先失败”掩盖出来的——它一直在那里，只是测试步骤从未跑到。
 - 格式化会移动 `index.ts` 行号，因此文档中 17 处 `index.ts:NNN` 引用已单次映射重算并逐条核对（顺序替换会串联错位——738 由 `context` 处理器变成了 `before_provider_request`）。
 
 ### 其它

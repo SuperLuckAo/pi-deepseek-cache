@@ -516,7 +516,7 @@ class CacheGraphOverlay implements Focusable {
       const chartRows: string[] = [];
       for (let r = chartH; r >= 0; r--) {
         const threshold = minRate + (maxRate - minRate) * (r / chartH);
-        let line = "";
+        let line: string;
         if (r === chartH) line = `${maxRate.toFixed(0)}%`.padStart(yW);
         else if (r === 0) line = `${minRate.toFixed(0)}%`.padStart(yW);
         else line = "".padStart(yW);
@@ -718,7 +718,9 @@ export default function (pi: ExtensionAPI) {
         if (existsSync(STATS_FILE)) unlinkSync(STATS_FILE);
         if (existsSync(HISTORY_FILE)) unlinkSync(HISTORY_FILE);
         if (existsSync(SUMMARY_CACHE_FILE)) unlinkSync(SUMMARY_CACHE_FILE);
-      } catch {}
+      } catch {
+        // 清理失败不影响重置语义：内存状态已清空，残留文件下次启动会被覆盖。
+      }
     },
   });
 

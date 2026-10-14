@@ -1,10 +1,23 @@
 # pi-deepseek-cache 变更日志
 
-## v0.3.1：对齐 pi 1.2.x 宿主 API 与 DeepSeek 现行口径
+## v0.4.0：对齐 pi 1.2.x 宿主 API、DeepSeek 现行口径与双语 UI
 
-> 本版本修正三类问题：（1）宿主包被当成 `dependencies`，既拉取重复运行时又触发 pi 的启动告警（#25 / #27，由外部贡献者修复合入）；（2）宿主 pi 早已从 0.84 升到 1.2，扩展的宿主 API 与类型依赖停留旧版；（3）v0.3.0 依据一条**已被官方撤销**的公告计算 v4-pro 价格。
+> 本次为**修复 + 新增**混合版本，因此用 minor 号：除了三类实质修复，还合入了双语 UI（#11，@François Chaix）与四项开发依赖升级。
+>
+> 修复三类问题：（1）宿主包被当成 `dependencies`，既拉取重复运行时又触发 pi 的启动告警（#25 / #27，由外部贡献者修复合入）；（2）宿主 pi 早已从 0.84 升到 1.2，扩展的宿主 API 与类型依赖停留旧版；（3）v0.3.0 依据一条**已被官方撤销**的公告计算 v4-pro 价格。
 >
 > 同时修复 CI：`lint` 步骤自 v0.2.0 起在每次 main 推送都失败，导致 `tsc` 与 `vitest` 长期没有把关（这也是下面这些问题能潜伏至今的直接原因）。
+
+### 新增
+
+- **双语 UI（#11，@François Chaix）**：全部 UI 文案（状态栏、`/cache-stats`、`/cache-graph`、错误提示、压缩摘要 prompt）改为集中式 `STRINGS` 表，支持 `en` / `zh`。语言按 `PI_DEEPSEEK_CACHE_LANG` → `LC_ALL` / `LC_MESSAGES` / `LANG` 依次解析，**非中文区域默认英文**；中文区域仍为中文。压缩摘要 prompt 新增“用对话的主要语言书写摘要”的要求（中英文一致）。
+  - 该 PR 基于 2026-09-10 的旧基线，维护者 rebase 时保留了 main 上更新的实现（`knownPrefixes` + `tools` 前缀指纹、`!auth.ok`-only 鉴权判定），并把 STRINGS 补齐到新版 UI 所需键位，避免回退 v0.3.0 的修复。
+- 测试环境固定 `PI_DEEPSEEK_CACHE_LANG=zh`（新增 `vitest.config.ts`）：否则 UI 语言随运行环境 locale 变化，在 `LANG=en_US.UTF-8` 下会有 13 条断言失败。现在中英文环境跑出的结果完全一致。
+
+### 依赖与工具链
+
+- 开发依赖升级：`prettier` 3.9.6 → 3.9.10、`eslint` 10.8.1 → 10.12.0、`typescript-eslint` 8.67.0 → 8.71.1、`vitest` 4.1.11 → **5.0.3**（大版本，已在 CI 验证通过）。
+- `npm audit` 因 `source-map-js@1.2.1`（GHSA-68fv-2mgg-jv7q，high，经 `vitest > vite > postcss`）失败，已补丁到 `1.2.2`。
 
 ### 修复：依赖声明（#25 / #27）
 
@@ -49,7 +62,7 @@
 ### 其它
 
 - `devDependencies` 的 pi 包从 `^0.84.2` 升到 `^1.2.0`。需说明的是：`tsc` 的 4 个错误**并非**这次升版引入——在 `main` 自己的 lockfile（锁定 0.84.2）上同样存在，根因是 pi-ai 1.x 起根入口不再导出 `complete`。升到 1.2.0 是为了让 CI 校验用户实际运行的宿主版本。
-- 同步更新 `docs/prefix-cache-principle.md` §4.3（v4-pro 价目表与假期规则）与全部 `index.ts:NNN` 行号引用，并新增覆盖 Pro 价、假期时段、未收录年份、谷值折半、摘要截断护栏与 headers-only 鉴权的测试（52 → 61）。
+- 同步更新 `docs/prefix-cache-principle.md` §4.3（v4-pro 价目表与假期规则）与全部 `index.ts:NNN` 行号引用，并新增覆盖 Pro 价、假期时段、未收录年份、谷值折半、摘要截断护栏与 headers-only 鉴权的测试（测试数 52 → 64）。
 
 ## v0.3.0 (2026-09-29): 对齐官方现行口径复查
 

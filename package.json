@@ -1,6 +1,6 @@
 {
   "name": "pi-deepseek-cache",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "DeepSeek prefix-cache extension for pi — hit-rate telemetry, prefix guard, and cache-friendly compaction.",
   "type": "module",
   "main": "./index.ts",

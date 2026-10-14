@@ -8,6 +8,8 @@
 
 这是最简单的方式，pi 会自动处理依赖和配置。
 
+> 本包**无运行时依赖**：`@earendil-works/pi-ai` / `pi-coding-agent` / `pi-tui` 由 pi 宿主提供（声明为 `peerDependencies: "*"`），pi 安装时使用 `--omit=peer`，因此不会额外下载任何包。
+
 ```bash
 # 安装到全局（所有项目可用）
 pi install ./pi-deepseek-cache

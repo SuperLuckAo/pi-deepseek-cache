@@ -21,16 +21,10 @@ type Listener = (...args: unknown[]) => unknown;
 /** mock 仅实现 on/registerCommand，cast 到真实 ExtensionAPI 以避免引入 any */
 const asApi = (api: ReturnType<typeof createMockExtensionAPI>) => api as unknown as ExtensionAPI;
 
-/** complete 的返回体在测试中只用 content 文本 */
-const completion = (text: string) =>
-  ({ content: [{ type: "text", text }] }) as unknown as Awaited<ReturnType<typeof complete>>;
+/** 摘要请求的返回体在测试中只用 content 文本 */
+type CompletionResult = { content: Array<{ type: string; text?: string }> };
+const completion = (text: string): CompletionResult => ({ content: [{ type: "text", text }] });
 
-vi.mock("@earendil-works/pi-ai", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@earendil-works/pi-ai")>();
-  return { ...actual, complete: vi.fn() };
-});
-
-const { complete } = await import("@earendil-works/pi-ai");
 import index from "../index.js";
 
 function createMockExtensionAPI() {
@@ -49,13 +43,16 @@ function createMockExtensionAPI() {
   };
 }
 
+/** 摘要在 1.2.x 走 ctx.modelRegistry.complete（由宿主在请求时解析鉴权） */
+const completeMock = vi.fn();
+
 const mockCtx = {
   ui: {
     setStatus: vi.fn(),
     notify: vi.fn(),
     custom: vi.fn().mockResolvedValue(undefined),
   },
-  modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn() },
+  modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn(), complete: completeMock },
 };
 
 /** 取某个事件的监听器 */
@@ -190,18 +187,18 @@ describe("P3: session_before_compact", () => {
     clearPersistedData(); api = createMockExtensionAPI();
     mockCtx.modelRegistry.find.mockReturnValue({ id: "deepseek-v4-flash", provider: "deepseek" });
     mockCtx.modelRegistry.getApiKeyAndHeaders.mockResolvedValue({ ok: true, apiKey: "sk-test", headers: {} });
-    vi.mocked(complete).mockReset();
+    completeMock.mockReset();
     index(api as any);
   });
 
   it("相同输入命中摘要缓存", async () => {
     const listener = (api.on as any).mock.calls.find(([e]: [string]) => e === "session_before_compact")?.[1];
     const prep = { messagesToSummarize: [{ role: "user", content: "hello" }], firstKeptEntryId: "e1", tokensBefore: 1000, previousSummary: "" };
-    vi.mocked(complete).mockResolvedValueOnce({ content: [{ type: "text", text: "summary A" }] } as any);
+    completeMock.mockResolvedValueOnce({ content: [{ type: "text", text: "summary A" }] } as any);
     expect((await listener({ preparation: prep, signal: new AbortController().signal }, mockCtx)).compaction.summary).toBe("summary A");
-    vi.mocked(complete).mockClear();
+    completeMock.mockClear();
     expect((await listener({ preparation: prep, signal: new AbortController().signal }, mockCtx)).compaction.summary).toBe("summary A");
-    expect(complete).not.toHaveBeenCalled();
+    expect(completeMock).not.toHaveBeenCalled();
   });
 
   it("模型不存在时回退", async () => {
@@ -212,9 +209,9 @@ describe("P3: session_before_compact", () => {
 
   it("previousSummary 并入 hash 输入", async () => {
     const listener = (api.on as any).mock.calls.find(([e]: [string]) => e === "session_before_compact")?.[1];
-    vi.mocked(complete).mockResolvedValueOnce({ content: [{ type: "text", text: "summary v1" }] } as any);
+    completeMock.mockResolvedValueOnce({ content: [{ type: "text", text: "summary v1" }] } as any);
     const r1 = await listener({ preparation: { messagesToSummarize: [{ role: "user", content: "same" }], firstKeptEntryId: "e1", tokensBefore: 100, previousSummary: "v1" }, signal: new AbortController().signal }, mockCtx);
-    vi.mocked(complete).mockResolvedValueOnce({ content: [{ type: "text", text: "summary v2" }] } as any);
+    completeMock.mockResolvedValueOnce({ content: [{ type: "text", text: "summary v2" }] } as any);
     const r2 = await listener({ preparation: { messagesToSummarize: [{ role: "user", content: "same" }], firstKeptEntryId: "e1", tokensBefore: 100, previousSummary: "v2" }, signal: new AbortController().signal }, mockCtx);
     expect(r1.compaction.summary).toBe("summary v1");
     expect(r2.compaction.summary).toBe("summary v2");
@@ -227,13 +224,13 @@ describe("P3: session_before_compact", () => {
   });
 
   it("complete 调用失败时回退", async () => {
-    vi.mocked(complete).mockRejectedValueOnce(new Error("API error"));
+    completeMock.mockRejectedValueOnce(new Error("API error"));
     const listener = (api.on as any).mock.calls.find(([e]: [string]) => e === "session_before_compact")?.[1];
     expect(await listener({ preparation: { messagesToSummarize: [{ role: "user", content: "test" }], firstKeptEntryId: "e1", tokensBefore: 500, previousSummary: "" }, signal: new AbortController().signal }, mockCtx)).toBeUndefined();
   });
 
   it("空摘要时回退", async () => {
-    vi.mocked(complete).mockResolvedValueOnce({ content: [{ type: "text", text: "   " }] } as any);
+    completeMock.mockResolvedValueOnce({ content: [{ type: "text", text: "   " }] } as any);
     const listener = (api.on as any).mock.calls.find(([e]: [string]) => e === "session_before_compact")?.[1];
     expect(await listener({ preparation: { messagesToSummarize: [], firstKeptEntryId: "e1", tokensBefore: 500, previousSummary: "" }, signal: new AbortController().signal }, mockCtx)).toBeUndefined();
   });
@@ -277,13 +274,52 @@ describe("R13: 官方定价", () => {
     expect(out).toContain("谷值时段");
   });
 
-  it("v4-pro 按 Flash 价结算（官方：2026-09-14 起 v4-pro 路由至 V4.1-Flash 并按 Flash 价计费）", async () => {
+  it("v4-pro 按 Pro 自身价目表计价（官方 2026-09-10：v4-pro 继续提供，计费方式不变）", async () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date(PEAK));
     await emit("deepseek-v4-pro", 1_000_000, 0);
     const out = await renderStats(api);
     expect(out).toContain("deepseek-v4-pro");
-    expect(out).toContain("hit $0.006 / miss $0.3 per 1M");
-    expect(out).toContain("$0.2940");
+    expect(out).toContain("hit $0.044 / miss $1.32 per 1M");
+    expect(out).toContain("$1.28");          // 1M × (1.32 − 0.044) = $1.276，大额固定 2 位小数
+  });
+
+  it("v4-pro 谷值价为其峰值价的一半", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(OFF_PEAK));
+    await emit("deepseek-v4-pro", 1_000_000, 0);
+    expect(await renderStats(api)).toContain("hit $0.022 / miss $0.66 per 1M");
+  });
+
+  // 2026-05-01（周五，劳动节）02:00 UTC 落在峰值窗口内，但官方注(2) 排除中国公共假期
+  const CN_HOLIDAY_PEAK_WINDOW = "2026-05-01T02:00:00Z";
+  // 2026-05-04（周一）同为劳动节假期
+  const CN_HOLIDAY_MONDAY = "2026-05-04T02:00:00Z";
+  // 2026-05-08（周五）假期之后，同为峰值窗口
+  const AFTER_HOLIDAY_FRIDAY = "2026-05-08T02:00:00Z";
+
+  it("中国公共假期内不开峰值（官方注(2) 排除中国公共假期）", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(CN_HOLIDAY_PEAK_WINDOW));
+    await emit("deepseek-flash", 1_000_000, 0);
+    const out = await renderStats(api);
+    expect(out).toContain("谷值时段");
+    expect(out).toContain("hit $0.003 / miss $0.15 per 1M");
+  });
+
+  it("假期期间的周一同样不开峰值", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(CN_HOLIDAY_MONDAY));
+    await emit("deepseek-flash", 1_000_000, 0);
+    expect(await renderStats(api)).toContain("谷值时段");
+  });
+
+  it("假期结束后同一时段恢复峰值", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date(AFTER_HOLIDAY_FRIDAY));
+    await emit("deepseek-flash", 1_000_000, 0);
+    expect(await renderStats(api)).toContain("峰值时段");
+  });
+
+  it("未收录年份不会误判为假期（退化为旧行为）", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2031-05-01T02:00:00Z"));
+    await emit("deepseek-flash", 1_000_000, 0);
+    expect(await renderStats(api)).toContain("峰值时段");
   });
 
   it("已停用的 deepseek-chat / deepseek-reasoner 仍能取到价（官方 2026-07-24 停用）", async () => {
@@ -439,7 +475,7 @@ describe("R15: 摘要器模型名", () => {
     clearPersistedData();
     mockCtx.ui.notify.mockClear();
     mockCtx.modelRegistry.getApiKeyAndHeaders.mockResolvedValue({ ok: true, apiKey: "sk-test", headers: {} });
-    vi.mocked(complete).mockReset();
+    completeMock.mockReset();
     api = createMockExtensionAPI();
     index(asApi(api));
     compact = listenerFor(api, "session_before_compact");
@@ -448,13 +484,13 @@ describe("R15: 摘要器模型名", () => {
 
   it("优先使用官方当前名 deepseek-flash", async () => {
     mockCtx.modelRegistry.find.mockImplementation((_p: string, id: string) => (id === "deepseek-flash" ? { id, provider: "deepseek" } : null));
-    vi.mocked(complete).mockResolvedValueOnce(completion("s1"));
+    completeMock.mockResolvedValueOnce(completion("s1"));
     expect((await run()).compaction.details.summarizer).toBe("deepseek-flash");
   });
 
   it("目录仅有 legacy 名时回退到 deepseek-v4-flash", async () => {
     mockCtx.modelRegistry.find.mockImplementation((_p: string, id: string) => (id === "deepseek-v4-flash" ? { id, provider: "deepseek" } : null));
-    vi.mocked(complete).mockResolvedValueOnce(completion("s2"));
+    completeMock.mockResolvedValueOnce(completion("s2"));
     expect((await run()).compaction.details.summarizer).toBe("deepseek-v4-flash");
   });
 

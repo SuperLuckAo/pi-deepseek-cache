@@ -1,4 +1,3 @@
-import { complete } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { matchesKey, visibleWidth, type Focusable } from "@earendil-works/pi-tui";
@@ -22,7 +21,7 @@ const FLAT_CHART_EPSILON = 0.05;
 
 // ───────── R13: 定价（官方 Models & Pricing，每百万 token，美元）─────────
 // Ground Truth: https://api-docs.deepseek.com/quick_start/pricing
-// 峰值时段为 01:00-04:00 与 06:00-10:00 UTC、周一至五（官方注(2) 另排除中国公共假期），
+// 峰值时段为 01:00-04:00 与 06:00-10:00 UTC、周一至五，并排除中国公共假期（见 CN_PUBLIC_HOLIDAYS），
 // 其余时段（含周末与全部节假日）为谷值，官方定义谷值 = 峰值 / 2。
 interface PriceTier {
   /** 缓存命中输入单价 */
@@ -31,19 +30,25 @@ interface PriceTier {
   miss: number;
 }
 const FLASH_TIER: PriceTier = { hit: 0.006, miss: 0.3 };
+const PRO_TIER: PriceTier = { hit: 0.044, miss: 1.32 };
 const DEEPSEEK_PRICING: Record<string, PriceTier> = {
   // 官方当前名，模型版本 DeepSeek-V4.1-Flash。
   "deepseek-flash": FLASH_TIER,
-  // 官方注(1)：legacy 名 deepseek-v4-flash 仍受理，但模型已退役，请求由
-  // DeepSeek-V4.1-Flash 服务并按 Flash 价计费。
+  // 官方注(1)：legacy 名 deepseek-v4-flash / deepseek-v4-flash-vision-exp 仍受理，
+  // 但对应模型已退役，请求由 DeepSeek-V4.1-Flash 服务并按 Flash 价计费。
   "deepseek-v4-flash": FLASH_TIER,
-  // v4-pro 暂时同价。官方公告：“Starting at 04:00 UTC on Sept 14, 2026, all
-  // deepseek-v4-pro requests will route to V4.1-Flash at V4.1-Flash rates.
-  // This will continue until V4.1-Pro launches.”
-  // https://www.deepseek.com/en/news/deepseek-v4-1-flash/
-  // 注意：/quick_start/pricing 仍展示 v4-pro 的历史价列（0.044 / 1.32），与该公告冲突。
-  // 本扩展统计的是实际结算价，故按公告口径取 Flash 价；V4.1-Pro 上线后需在此处单独加价。
-  "deepseek-v4-pro": FLASH_TIER,
+  "deepseek-v4-flash-vision-exp": FLASH_TIER,
+  // 官方 2026-09-10 变更日志：“In response to user demand, we have decided to
+  // continue providing API services for DeepSeek V4 Pro after September 14, 2026,
+  // with the billing method remaining unchanged.”
+  // https://api-docs.deepseek.com/updates
+  // 即 v4-pro 并未路由到 V4.1-Flash，仍按自身价目表结算（模型版本 DeepSeek-V4-Pro-0813）：
+  // 命中 0.044 / 未命中 1.32（峰值）。
+  // v0.3.0 曾按已作废的"路由至 Flash 并按 Flash 价计费"公告取 Flash 价，会把 v4-pro
+  // 用户的节省额少算约 7 倍；已改回官方价目表。pi 自己的模型目录
+  // （@earendil-works/pi-ai providers/data/deepseek.json）也仍是
+  // cacheRead 0.044 / input 1.32，与此一致。
+  "deepseek-v4-pro": PRO_TIER,
   // 官方已于 2026-07-24 停用 deepseek-chat / deepseek-reasoner（它们只是 v4-flash
   // 的思考/非思考模式别名，从未是独立模型）；保留映射仅为旧会话或自建代理兜底。
   "deepseek-chat": FLASH_TIER,
@@ -56,10 +61,38 @@ const PEAK_HOURS_UTC: ReadonlyArray<readonly [number, number]> = [
   [6, 10],
 ];
 
-/** 官方注(2)：01:00-04:00 / 06:00-10:00 UTC，周一至五 */
+/**
+ * 官方注(2) 的峰值窗口为 01:00-04:00 / 06:00-10:00 UTC 的**周一至周五**，且
+ * **排除中国公共假期**（周末与中国公共假期全时段均为谷值）。
+ *
+ * 假期按中国标准时间（UTC+8）的自然日判定。数据取自国务院办公厅《关于2026年
+ * 部分节假日安排的通知》（国办发明电〔2025〕7号）：
+ * https://www.gov.cn/zhengce/content/202511/content_7047090.htm
+ * 已收录年份：2026。未收录的年份不匹配任何区间，即退化为“不排除假期”（等价于
+ * 旧行为，只会保守地高估而非低估峰值），因此漏更新不会产生静默错误。
+ * 国办每年发布次年安排后需在此追加区间。
+ */
+const CN_PUBLIC_HOLIDAYS: ReadonlyArray<readonly [string, string]> = [
+  ["2026-01-01", "2026-01-03"], // 元旦
+  ["2026-02-15", "2026-02-23"], // 春节
+  ["2026-04-04", "2026-04-06"], // 清明节
+  ["2026-05-01", "2026-05-05"], // 劳动节
+  ["2026-06-19", "2026-06-21"], // 端午节
+  ["2026-09-25", "2026-09-27"], // 中秋节
+  ["2026-10-01", "2026-10-07"], // 国庆节
+];
+
+/** 该时刻对应的中国标准时间自然日是否为中国公共假期 */
+function isCstPublicHoliday(now: Date): boolean {
+  const cstDate = new Date(now.getTime() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  return CN_PUBLIC_HOLIDAYS.some(([start, end]) => cstDate >= start && cstDate <= end);
+}
+
+/** 官方注(2)：01:00-04:00 / 06:00-10:00 UTC，周一至五，排除中国公共假期 */
 function isPeakWindow(now: Date): boolean {
   const day = now.getUTCDay();
   if (day === 0 || day === 6) return false;
+  if (isCstPublicHoliday(now)) return false;
   const hour = now.getUTCHours();
   return PEAK_HOURS_UTC.some(([start, end]) => hour >= start && hour < end);
 }
@@ -86,16 +119,6 @@ const MAX_SUMMARY_CACHE = 64;
 const SUMMARIZER_CANDIDATES = ["deepseek-flash", "deepseek-v4-flash"];
 
 // ───────── R9: 局部类型定义，消除 any ─────────
-
-interface CachedMessage {
-  role: string;
-  content?: string;
-  customType?: string;
-}
-
-interface ProviderPayload {
-  messages?: CachedMessage[];
-}
 
 interface PersistedStats {
   cacheRead: number;
@@ -645,7 +668,7 @@ export default function (pi: ExtensionAPI) {
     description: "DeepSeek 前缀缓存命中率",
     handler: async (_args, ctx) => {
       setExtensionCtx(ctx);
-      await ctx.ui.custom(
+      await ctx.ui.custom<void>(
         (_tui, theme, _kb, done) =>
           new CacheStatsOverlay(theme, buildStatsView(), done),
         { overlay: true },
@@ -658,7 +681,7 @@ export default function (pi: ExtensionAPI) {
     description: "DeepSeek 缓存命中率趋势图",
     handler: async (_args, ctx) => {
       setExtensionCtx(ctx);
-      await ctx.ui.custom(
+      await ctx.ui.custom<void>(
         (_tui, theme, _kb, done) =>
           new CacheGraphOverlay(theme, hitRateHistory, done),
         { overlay: true },
@@ -698,8 +721,13 @@ export default function (pi: ExtensionAPI) {
   // ───────── P2 前缀守卫 ─────────
   pi.on("context", async (event, ctx) => {
     setExtensionCtx(ctx);
-    const msgs = Array.isArray((event as unknown as {messages?: unknown}).messages) ? (event.messages as CachedMessage[]) : [];
-    const onWire = msgs.filter((m: CachedMessage) => m?.customType !== "volatile-scratch");
+    // 剔除标记为 volatile-scratch 的自定义消息：它们每轮都变，会击穿前缀。
+    // pi 1.2.x 的 AgentMessage 联合类型不再声明 customType（改由各扩展自行声明
+    // 消息类型），故按结构化属性读取；没有该类消息时原样返回全部消息。
+    if (!Array.isArray(event.messages)) return undefined;
+    const onWire = event.messages.filter(
+      (m) => (m as unknown as { customType?: unknown }).customType !== "volatile-scratch",
+    );
     return { messages: onWire };
   });
 
@@ -828,7 +856,10 @@ async function summarizeWithFlash(
   }
 
   try {
-    const response = await complete(
+    // ModelRegistry.complete 在请求时自行解析鉴权（apiKey / OAuth / headers），
+    // 因此不再需要从 @earendil-works/pi-ai 引入 compat 的 complete()，
+    // 扩展也不再需要任何 pi-ai 依赖。
+    const response = await ctx.modelRegistry.complete(
       model,
       {
         messages: [
@@ -847,14 +878,13 @@ async function summarizeWithFlash(
             timestamp: Date.now(),
           },
         ],
-        temperature: 0,
       },
-      { apiKey: auth.apiKey, headers: auth.headers, maxTokens: SUMMARY_MAX_TOKENS, signal },
+      { maxTokens: SUMMARY_MAX_TOKENS, temperature: 0, signal },
     );
 
-    const summary = (response as { content: Array<{ type: string; text?: string }> }).content
+    const summary = response.content
       .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map((c: { text: string }) => c.text)
+      .map((c) => c.text)
       .join("\n");
 
     return summary.trim() ? { summary: summary.trim(), model: model.id } : undefined;

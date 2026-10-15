@@ -287,12 +287,19 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 - 官方注(1)：legacy 名 `deepseek-v4-flash` 与 `deepseek-v4-flash-vision-exp` 仍受理，但对应模型已退役，请求由 DeepSeek-V4.1-Flash 服务并按 Flash 价计费。
 - 官方已于 **2026-07-24** 停用 `deepseek-chat` / `deepseek-reasoner`（二者从未是独立模型，只是 `deepseek-v4-flash` 的思考 / 非思考模式别名）；本项目保留同价映射仅供旧会话与自建代理兜底。
 
-- **本项目实现**（`index.ts` `DEEPSEEK_PRICING` / `CN_PUBLIC_HOLIDAYS` / `isPeakWindow` / `currentPricing`）：
-  - 按当前 wire model 选价目表，未知模型取保守下界（flash 谷值）而非高估；
-  - 按调用时刻判断 peak / off-peak，谷值自动减半；
-  - 峰值窗口排除中国公共假期（按 UTC+8 自然日判定，数据源见 `CN_PUBLIC_HOLIDAYS` 注释；未收录年份退化为"不排除假期"，只会保守地高估而非低估峰值）；
-  - `saved = cacheRead / 1e6 * (miss − hit)`；
-  - `/cache-stats` 同时展示当前模型、时段与单价，避免黑盒数字。
+- **本项目实现**（`index.ts` `resolvePricing` / `costToTier` / `DEEPSEEK_PRICING` / `CN_PUBLIC_HOLIDAYS` / `isPeakWindow`）——v0.5 起按 provider 分成两条路径：
+
+  | provider           | 单价来源                                                                                          | 峰谷                                                                    |
+  | ------------------ | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+  | 官方 `deepseek`    | 官方价目表（`DEEPSEEK_PRICING`，含 legacy 名与已停用名）；表中没有该模型才退回模型目录            | 按调用时刻判断 peak / off-peak，谷值减半；峰值窗口排除中国公共假期      |
+  | 其他（第三方部署） | **模型目录的 `cost`**（`models.json` / pi 内置目录）：`hit = cost.cacheRead`、`miss = cost.input` | **不适用**：第三方按 flat 价结算，折半即把节省额算错一半（v0.4 的行为） |
+
+  解析顺序为 **目录 `cost` → 官方价目表 → unpriced → 保守下界**：
+
+  - 目录里有该模型但 `input` 为 0（免费 / 未标价）→ `unpriced`，**不估算节省**（`/cache-stats` 显示 `—`），避免给免费模型编出一笔钱；
+  - 目录里根本没有该模型 → 取官方 flash 谷值作保守下界，宁少不多；
+  - pi 内置目录里 `deepseek-flash` 为 0.006/0.3、`deepseek-v4-pro` 为 0.044/1.32，与官方价目表**峰值**一致，因此官方 provider 不论走哪条来源结果都相同；
+  - `saved = cacheRead / 1e6 * (miss − hit)`；`/cache-stats` 标明**单价来源**（模型目录价 / 官方价目表 · 峰谷 / 保守下界（无价目数据） / 模型目录未标价）与单价，避免黑盒数字。
 
 > 历史说明：本文早期版本与 v0.2.1 代码曾使用 0.027/0.27（后改为 0.014/0.44），二者均不对应现行价目表（0.014 是 2024 年 news0802 的首发 cache-hit 价，0.44 约为 pi-ai 中 `deepseek-v4-pro` 的 input 成本，与注释标称的 flash 不符）。已按官方价目表重写。
 
@@ -302,14 +309,15 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 
 以下任一变化都会使可复用前缀在变化点截断，之后全部按 miss 计费：
 
-| 类别             | 典型例子                                                  | 说明                                                                                                                                 |
-| ---------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| **System 变化**  | persona/prompt 模板改动、动态时间戳注入                   | Harness 中 system 来自 ctx.systemPrompt，一旦 persona 切换即新前缀                                                                   |
-| **Tools 变化**   | 工具增删、JSON Schema 字段顺序变化                        | 工具数组序列化参与前缀比较                                                                                                           |
-| **历史重写**     | 编辑/重排已发送的 message、compaction 替换 head           | compaction-basic 明确标记 Replacing rather than append-only. Each checkpoint invalidates reuse from the first replaced history token |
-| **路由变化**     | 切换 provider/model                                       | 见命中条件 3.1                                                                                                                       |
-| **易变内容前置** | 将时间戳、随机 ID、大块非确定性工具输出放在靠前位置       | 使可复用单元变短；按官方现行口径，需**完整匹配**某个已落盘单元才能命中，故稳定内容应尽量越过所有易变段                               |
-| **非追加式写入** | 持久化修复重写较早历史（Harness 已规避：修复结果 append） | 多个包文档强调 append without rewriting earlier history                                                                              |
+| 类别             | 典型例子                                                  | 说明                                                                                                                                                                                                                     |
+| ---------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **System 变化**  | persona/prompt 模板改动、动态时间戳注入                   | Harness 中 system 来自 ctx.systemPrompt，一旦 persona 切换即新前缀                                                                                                                                                       |
+| **Tools 变化**   | 工具增删、JSON Schema 字段顺序变化                        | 工具数组序列化参与前缀比较                                                                                                                                                                                               |
+| **历史重写**     | 编辑/重排已发送的 message、compaction 替换 head           | compaction-basic 明确标记 Replacing rather than append-only. Each checkpoint invalidates reuse from the first replaced history token                                                                                     |
+| **路由变化**     | 切换 provider/model                                       | 见命中条件 3.1                                                                                                                                                                                                           |
+| **实例漂移**     | router 把同一会话发到另一个后端副本                       | 自建引擎（vLLM/SGLang 等）的 prefix cache 通常**按实例**，换副本等于换缓存；这一点与「前缀被改写」在 wire 字节上不可区分，本项目的前缀诊断分不出两者。会话亲和（如 magpie 的 `compat.sendSessionAffinityHeaders`）可规避 |
+| **易变内容前置** | 将时间戳、随机 ID、大块非确定性工具输出放在靠前位置       | 使可复用单元变短；按官方现行口径，需**完整匹配**某个已落盘单元才能命中，故稳定内容应尽量越过所有易变段                                                                                                                   |
+| **非追加式写入** | 持久化修复重写较早历史（Harness 已规避：修复结果 append） | 多个包文档强调 append without rewriting earlier history                                                                                                                                                                  |
 
 > 设计原则：把稳定内容放前、易变内容放后、只追加不重写。
 
@@ -426,11 +434,11 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 
 ### 7.1 三钩子如何复刻 Harness 手段
 
-| Pi 钩子                 | 触发时机                          | 复刻的 Harness 手段                                             | 本项目做法                                                                                                                          |
-| ----------------------- | --------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| context                 | 每次组装上下文、即将并入请求前    | 固定 System Prompt 的易变内容后置与 append-only                 | 过滤 customType volatile-scratch 的易变消息，使其不进入 wire 前缀（index.ts:738 pi.on(context, ...)），避免时间戳/草稿截断稳定前缀  |
-| before_provider_request | provider payload 已组装、尚未发送 | 工具字典序 + Wire 确定性序列化 + 请求头折叠的发送前最后一致性门 | 见 7.2                                                                                                                              |
-| session_before_compact  | 压缩前，允许扩展接管总结          | Compaction verbatim 回放（**未对齐**，见 7.4）                  | 以 `deepseek-flash`（兼容 legacy 名 `deepseek-v4-flash`）@ temperature 0 做确定性总结，结果按 SHA-256 去重并落盘 summary-cache.json |
+| Pi 钩子                 | 触发时机                          | 复刻的 Harness 手段                                             | 本项目做法                                                                                                                                                                                                                      |
+| ----------------------- | --------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| context                 | 每次组装上下文、即将并入请求前    | 固定 System Prompt 的易变内容后置与 append-only                 | 过滤 customType volatile-scratch 的易变消息，使其不进入 wire 前缀（index.ts:738 pi.on(context, ...)），避免时间戳/草稿截断稳定前缀                                                                                              |
+| before_provider_request | provider payload 已组装、尚未发送 | 工具字典序 + Wire 确定性序列化 + 请求头折叠的发送前最后一致性门 | 见 7.2                                                                                                                                                                                                                          |
+| session_before_compact  | 压缩前，允许扩展接管总结          | Compaction verbatim 回放（**未对齐**，见 7.4）                  | 以官方 `deepseek-flash`（兼容 legacy 名 `deepseek-v4-flash`）@ temperature 0 做确定性总结；官方模型不存在时按「当前模型已是 flash 档 → 当前 provider 的 flash 档 → 当前模型」回退，结果按 SHA-256 去重并落盘 summary-cache.json |
 
 #### context — 易变内容隔离
 
@@ -490,7 +498,7 @@ pi.on("session_before_compact", async (event, ctx) => {
   const key = createHash("sha256").update(text).digest("hex");
   let summary = summaryCache.get(key);
   if (!summary) {
-    summary = await summarizeWithFlash(text, ctx, signal); // deepseek-v4-flash, temperature 0
+    summary = await summarizeWithModel(text, ctx, signal); // resolveSummarizerModel 选定, temperature 0
     setSummaryCache(summaryCache, key, summary);
     saveSummaryCache(summaryCache);
   }
@@ -509,16 +517,16 @@ pi.on("session_before_compact", async (event, ctx) => {
 
 **Harness 的做法（见 6.5）**：总结器逐条回放会话自身的 `system`、`tools` 与被遮蔽区消息，仅在末尾追加一条 `COMPACTION_INSTRUCTION` 作为最后一条 user 消息，使辅助调用成为上一轮路由请求的**真前缀扩展**，从而复用 warm KV cache。
 
-**本项目的做法**（`index.ts` `summarizeWithFlash`）：把 `serializeConversation(...)` 的历史**序列化为单条 user 消息文本**，与指令拼接后一次发出；不传 `system`、不传 `tools`、不按消息逐条回放。
+**本项目的做法**（`index.ts` `summarizeWithModel` + `resolveSummarizerModel`）：把 `serializeConversation(...)` 的历史**序列化为单条 user 消息文本**，与指令拼接后一次发出；不传 `system`、不传 `tools`、不按消息逐条回放。模型选择也不再写死官方 provider：官方候选名（`deepseek-flash` / legacy `deepseek-v4-flash`）→ 当前模型已是 `flash` 档则直接用当前模型 → 当前 provider 的 `flash` 档（优先名字含 `deepseek`）→ 当前模型。
 
 **差异与后果**（不得再声称 parity）：
 
-| 维度     | Harness verbatim 回放                  | 本项目                                                        |
-| -------- | -------------------------------------- | ------------------------------------------------------------- |
-| 前缀形态 | 上一轮请求的真前缀扩展                 | 全新前缀，与上一轮无字节重合                                  |
-| 缓存效果 | 复用 warm cache，仅 prefill 新增的指令 | 每次 compaction 冷启动，全量 prefill 整段历史                 |
-| 稳定内容 | 指令置于最后，历史变动不影响前缀       | 指令与历史拼接在同一段文本内，历史一变即全量重算              |
-| 路由     | 透传原 provider/model                  | 固定走 `deepseek-flash`（官方注(1)：legacy 名已退役但仍受理） |
+| 维度     | Harness verbatim 回放                  | 本项目                                                                                                                                             |
+| -------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 前缀形态 | 上一轮请求的真前缀扩展                 | 全新前缀，与上一轮无字节重合                                                                                                                       |
+| 缓存效果 | 复用 warm cache，仅 prefill 新增的指令 | 每次 compaction 冷启动，全量 prefill 整段历史                                                                                                      |
+| 稳定内容 | 指令置于最后，历史变动不影响前缀       | 指令与历史拼接在同一段文本内，历史一变即全量重算                                                                                                   |
+| 路由     | 透传原 provider/model                  | v0.5 起：官方 `deepseek` provider 上的 `deepseek-flash`（legacy 名回退）→ 当前模型已是 `flash` 档时直接用 → 当前 provider 的 `flash` 档 → 当前模型 |
 
 补充：摘要缓存 key 为 `sha256(序列化历史全文)`，需历史**逐字节相同**才能命中。因此“跨会话复用”在实践中几乎不会发生（跨会话历史必然不同），真实命中场景是同会话内对同一压缩集合重复总结。
 
@@ -551,14 +559,16 @@ pi.on("session_before_compact", async (event, ctx) => {
 
 ### 7.3 遥测与可视化（P1）
 
-| 能力                                                                                                                                             | 实现                                         |
-| ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------- |
-| 监听 message_end 累积 cacheRead / input / cacheWrite / turns，并记录 wire model                                                                  | index.ts message_end 处理                    |
-| 落盘 ~/.pi/agent/extensions/deepseek-cache/stats.json                                                                                            | atomicWriteJson                              |
-| 状态栏实时显示 cache xx.x% · Nt（累计口径）                                                                                                      | index.ts status bar                          |
-| /cache-stats 同时展示**累计**命中率与**本轮**命中率（官方为按请求逐次统计口径，两者不同）                                                        | index.ts `StatsView.lastTurnHitRate`         |
-| 节省额按当前模型 + peak/off-peak 时段计价（`saved = cacheRead/1e6 * (miss − hit)`），并展示所用模型、时段与单价；小额用 4 位小数避免丢失有效信息 | index.ts `currentPricing` / `buildStatsView` |
-| 官方 usage 无 cache write 字段，未观测到非零写入时隐藏「缓存写入」行（避免恒为 0 的死 UI）                                                       | index.ts `reportsCacheWrite`                 |
+| 能力                                                                                                                                                       | 实现                                          |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| 监听 message_end 累积 cacheRead / input / cacheWrite / turns，**按模型（provider + id）分桶**（v0.5）                                                      | index.ts message_end 处理                     |
+| 落盘 ~/.pi/agent/extensions/deepseek-cache/stats.json（v2 = `byModel[]`；v1 的扁平累计读取时归入 `unknown` 桶）                                            | `normalizeStats` / atomicWriteJson            |
+| 状态栏实时显示 cache xx.x% · Nt（**当前模型**口径；切模型不继承上一个模型的数字）                                                                          | index.ts status bar                           |
+| /cache-stats 头部为当前模型，另有「全部模型累计」与按 token 量排序的按模型明细（最多 3 行，弹窗不滚动）                                                    | index.ts `buildStatsView` / `MAX_BUCKET_ROWS` |
+| 同时展示**累计**命中率与**本轮**命中率（官方为按请求逐次统计口径，两者不同）                                                                               | index.ts `StatsView.lastTurnHitRate`          |
+| 节省额按**模型目录单价**计价（`saved = cacheRead/1e6 * (miss − hit)`），仅官方 `deepseek` provider 套用峰谷折半；展示单价来源、模型与单价；小额用 4 位小数 | index.ts `resolvePricing` / `buildStatsView`  |
+| 目录零价（免费 / 未标价模型）时不估算节省，显示 `—`（v0.5）                                                                                                | index.ts `PricingResolution.available`        |
+| 官方 usage 无 cache write 字段，未观测到非零写入时隐藏「缓存写入」行（避免恒为 0 的死 UI）                                                                 | index.ts `reportsCacheWrite`                  |
 
 ---
 
@@ -567,7 +577,7 @@ pi.on("session_before_compact", async (event, ctx) => {
 - **DeepSeek 官方**
   - [Context Caching — DeepSeek API Docs](https://api-docs.deepseek.com/guides/kv_cache) — 硬盘缓存总述、三种持久化、两示例、计费二字段、best-effort（本文第 2 章 Ground Truth 来源）
   - [API Introduces Context Caching on Disk — News 2024-08-02](https://api-docs.deepseek.com/news/news0802) — 首次发布。**旧口径参考**：其中 “cache hit $0.014/M、miss $0.14/M” 与 “64 token 存储单元” 均为 2024 年首发价与旧粒度，已被现行价目表与现行缓存粒度取代（见 3.3 / 4.3）
-  - [Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing) — 现行价目表、peak/off-peak 规则（官方注(2)）、legacy 模型名说明（官方注(1)）；本项目按该表与时段计价
+  - [Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing) — 现行价目表、peak/off-peak 规则（官方注(2)）、legacy 模型名说明（官方注(1)）；官方 `deepseek` provider 按该表与时段计价（第三方部署按模型目录价，见 4.3 / README「第三方部署」一节）
 
 - **Harness 源码（相对 deepseek-harness 仓库根；安装产物路径见第 6 章表格）**
   - packages/llm/llm-deepseek/README.md — deepseek-official 路由与适配器
@@ -589,15 +599,15 @@ pi.on("session_before_compact", async (event, ctx) => {
 - **本项目**
   - index.ts:172 — stableStringify 字节稳定序列化
   - index.ts:193 — atomicWriteJson 原子落盘
-  - index.ts:41 — DEEPSEEK_PRICING 官方价目表（含 peak/off-peak、v4-pro 独立价与 legacy 名）
+  - index.ts:41 — DEEPSEEK_PRICING 官方价目表（含 peak/off-peak、v4-pro 独立价与 legacy 名）；v0.5 起为**兜底**，优先取模型目录 cost（见 4.3）
   - index.ts:83 — CN_PUBLIC_HOLIDAYS 中国公共假期（峰值窗口排除）
   - index.ts:100 — isPeakWindow 峰值/谷值判定
   - index.ts:738 — context 易变隔离
   - index.ts:754 — before_provider_request 工具排序 + system/tools/messages 三段前缀指纹
   - index.ts:810 — session_before_compact 确定性总结与摘要缓存
-  - index.ts:878 — summarizeWithFlash 独立冷调用（非 verbatim 回放，见 7.4）
+  - index.ts:878 — summarizeWithModel 独立冷调用（非 verbatim 回放，见 7.4）
   - README.md — 功能总览与 [DeepSeek Context Caching docs](https://api-docs.deepseek.com/guides/kv_cache) 入口
 
 ---
 
-_最后更新：2026-09-29（对齐官方现行 kv_cache 口径与现行价目表）· 维护者：pi-deepseek-cache_
+_最后更新：2026-10-15（v0.5.0：第三方部署计价与摘要器、按模型分桶）· 维护者：pi-deepseek-cache_

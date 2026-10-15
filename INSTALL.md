@@ -98,37 +98,67 @@ ls -la ~/.pi/agent/extensions/
 ls -la .pi/extensions/
 ```
 
-## 配置 DeepSeek API Key
+## 配置模型
 
-扩展需要 DeepSeek API Key 才能正常工作。
+扩展本身不要求任何 API Key，也不要求 provider 叫 `deepseek`：它读的是模型目录里当前模型的 `cost`，以及响应里的 `usage`。两种典型配置：
 
-### 临时设置
+### 方式 1: 官方 DeepSeek provider
 
-```bash
-export DEEPSEEK_API_KEY=sk-...
-```
-
-### 永久设置
-
-将以下行添加到 `~/.zshrc` 或 `~/.bashrc`：
+官方 provider 会额外启用官方峰谷价目表（$0.006/$0.3 峰值、谷值减半）。
 
 ```bash
 export DEEPSEEK_API_KEY=sk-...
+pi --model deepseek/deepseek-v4-flash
 ```
 
-然后重新加载配置：
+永久生效：把 `export DEEPSEEK_API_KEY=sk-...` 加进 `~/.zshrc` 或 `~/.bashrc`，然后 `source ~/.zshrc`。
+
+### 方式 2: 第三方部署（OpenAI 兼容端点）
+
+在 `~/.pi/agent/models.json` 里加一个 provider（router / 自建 vLLM / 托管服务均可），并**把单价填准**——对非官方 provider，这里是节省额唯一信任的依据：
+
+```jsonc
+{
+  "providers": {
+    "my-router": {
+      "api": "openai-completions",
+      "baseUrl": "https://my-router.example/v1",
+      "apiKey": "...",
+      "models": [
+        {
+          "id": "deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash (my-router)",
+          "contextWindow": 1000000,
+          "maxTokens": 384000,
+          "cost": { "input": 0.15, "output": 0.28, "cacheRead": 0.003, "cacheWrite": 0 },
+        },
+      ],
+    },
+  },
+}
+```
 
 ```bash
-source ~/.zshrc
+pi --model my-router/deepseek-v4.1-flash
 ```
+
+要点：
+
+- 第三方 provider **不做峰谷折半**（峰谷是 DeepSeek 的计费策略，不是宿主的）；单价直接取 `cost.cacheRead` / `cost.input`。
+- `cost` 缺省或 `input` 为 0（免费 / 未标价模型）时，`/cache-stats` 的「预估节省」显示 `—`，不编数字。
+- 端点若不上报命中 token（`usage` 里没有 `prompt_cache_hit_tokens` / `prompt_tokens_details.cached_tokens`），命中率会恒为 0% —— 这是端点的限制，不是扩展的问题。
+- 自建引擎的 prefix cache 通常**按实例**，一次 miss 可能是 router 把你换到了另一个副本。router 若能固定会话后端（magpie 用 `compat.sendSessionAffinityHeaders`），保持开启。
 
 ## 使用扩展
 
 ### 启动 pi
 
 ```bash
-# 使用 DeepSeek 模型
+# 官方 DeepSeek
 pi --model deepseek/deepseek-v4-flash
+
+# 第三方部署
+pi --model my-router/deepseek-v4.1-flash
 
 # 或使用默认模型（如果已配置）
 pi
@@ -191,15 +221,17 @@ pi --verbose
 pi --extension ./pi-deepseek-cache/index.ts --print "/cache-stats"
 ```
 
-### 问题 3: API Key 错误
+### 问题 3: API Key / 模型不可用
 
 ```bash
-# 检查 API Key 是否设置
+# 检查 DeepSeek API Key 是否设置（仅官方 provider 需要）
 echo $DEEPSEEK_API_KEY
 
-# 测试 API Key
-curl -H "Authorization: Bearer $DEEPSEEK_API_KEY" https://api.deepseek.com/v1/models
+# 检查 pi 是否真的看得到该模型
+pi --list-models | grep -i deepseek
 ```
+
+> 第三方部署报这类错时，先查 `~/.pi/agent/models.json` 里的 `baseUrl` / `apiKey` / `models[].id` 是否与端点一致，而不是查 DeepSeek 的 Key。
 
 ## 相关文档
 

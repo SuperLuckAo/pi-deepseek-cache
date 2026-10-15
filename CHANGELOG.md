@@ -1,5 +1,44 @@
 # pi-deepseek-cache 变更日志
 
+## v0.5.0：让第三方部署真正可用（模型目录计价、按模型分桶、provider 无关的摘要器）
+
+> 起因：本扩展此前的隐含前提是「provider 就是官方 `deepseek`」。这个前提在**第三方部署**——把 DeepSeek 放在 OpenAI 兼容端点后面的 router、自建 vLLM/SGLang、托管服务——上会同时错三处：定价、摘要器、统计口径。三者都是“不报错、但数字／行为静默错”的类型。
+>
+> 验证环境（真实第三方部署）：`magpie/open-design/deepseek-v4.1-flash` → `https://amr-link.open-design.ai/v1`，目录价 cacheRead $0.003 / input $0.15，3184 轮实测缓存命中率 98.7%。
+
+### 新增
+
+- **`PI_DEEPSEEK_CACHE_DIR` 环境变量**：覆盖 `stats.json` / `history.json` / `summary-cache.json` 的目录（默认 `~/.pi/agent/extensions/deepseek-cache`）。测试套件用它做隔离——旧测试会在 `beforeEach` 里直接删掉用户真实目录里的统计文件（本机实测：跑一次 `npm test` 就把正在用的统计清空了）。
+
+### 修复
+
+- **定价改为以模型目录为准（严重：第三方部署节省额算错一半）**：
+  - 旧实现 `lookupPricing(wire model)` 只认官方模型名（`deepseek-flash` / `deepseek-v4-flash` / `deepseek-v4-pro` / `deepseek-chat` / `deepseek-reasoner`），其余一律落到 `DEFAULT_PRICING`，并且对**任何** provider 都按官方峰谷规则折半。
+  - 实测差异：`"open-design/deepseek-v4.1-flash"` 不匹配任何官方名（连 `deepseek-v4-flash` 也不匹配——版本是 `v4.1`），因此落到 `DEFAULT_PRICING` 0.003/0.15。这个数值恰与官方 flash **谷值**相同，看似“对了”，但接着按官方峰谷规则折半：**谷值时段（含全部周末/节假日，工作日 12:00–14:00 与 18:00–09:00 CST）节省额只剩一半**，与 pi 自己按目录价写进 `usage.cost` 的数字直接矛盾。
+  - 新实现 `resolvePricing()`：**目录 `cost` → 官方价目表 → unpriced → 保守下界**。其中第三档是新增的：模型在目录里存在但零价（免费 / 未标价）时**不估算节省**，旧实现会给这类模型编出一笔节省。峰谷折半**只在 provider id 为官方 `deepseek` 时**启用（峰谷是 DeepSeek 的计费策略，不是宿主的）。
+  - `/cache-stats` 现在标出单价来源（模型目录价 / 官方价目表 · 峰值时段 / 官方价目表 · 谷值时段 / 保守下界（无价目数据） / 模型目录未标价），不再让用户猜数字从哪来；目录无价时“预估节省”显示 `—`。
+  - 官方用户行为不变：pi 内置目录里 `deepseek-flash` 为 0.006/0.3、`deepseek-v4-pro` 为 0.044/1.32，与官方价目表的**峰值**单价一致，折半后与旧的硬编码结果逐一相同（R13 全部用例原样保留）。
+- **摘要器不再写死官方 provider（严重：第三方部署下 P3 是死代码）**：
+  - 旧实现 `ctx.modelRegistry.find("deepseek", id)`：只配了非官方 provider 的环境永远落空 → 每次 compaction 都 notify「找不到摘要模型」并回退默认 compaction（本机只有 `magpie`，实测如此）。
+  - 新实现 `resolveSummarizerModel()`：官方候选名（`deepseek-flash` / legacy `deepseek-v4-flash`）→ 当前模型本身已是 `flash` 档则直接用 → **当前 provider** 的 `flash` 档（优先名字含 `deepseek`，多候选取字典序最小以保证跨轮稳定）→ 当前模型 → 都没有才回退。中间那一步有实际意义：第三方 router 常同时挂多个后端的同款 flash（本机实测 `open-design/deepseek-v4.1-flash` 与 `amd/DeepSeek-V4.1-Flash` 并存），而“当前模型就是 flash 档”时没有任何理由做意外路由。
+  - `summary-cache.json` 的值由裸字符串改为 `{ summary, model }`（旧格式仍可读，模型名记为“未知模型”），因此 `details.summarizer` 在缓存命中时不再对任何 provider 都写 `deepseek-flash`。
+  - 失败提示带上真实模型名；顺手修掉旧提示把“flash 摘要”叙述两遍的毛病（旧输出形如 `flash 摘要失败:flash 摘要 失败：boom,回退默认 compaction`）。
+- **统计按模型分桶（中等：混合多个模型时命中率与节省额互相污染）**：
+  - 旧实现是单一扁平累计 + 用「最后一条消息的模型」给全部历史计价。在第三方 router（一个 provider 后面挂多个后端）或在 `enabledModels` 里同时勾了 DeepSeek 与别的模型时，底栏那个命中率与那笔节省额都不再有意义。
+  - 新实现：`stats.json` 升到 v2（`byModel: ModelBucket[]`，含 provider / id / cacheWriteReported）。`/cache-stats` 头部是**当前模型**，另有「全部模型累计」与按 token 量排序的按模型明细（最多 3 行 + 「还有 N 个模型」，弹窗不滚动，高度有测试守住）；底栏改为**当前模型**口径，切换模型不再继承上一个模型的数字。
+  - `/cache-graph` 仍是全部模型累计口径（标题已注明），避免为了分桶把趋势图也拆得看不懂。
+  - 迁移：v0.4 及更早的扁平 `stats.json` 读取时归入 `unknown` 桶（显示为“未知模型”），**不静默清零**；v2 读盘逐桶校验，负数/非有限值归一化为 0，非法项丢弃。
+
+### 文档
+
+- README（中英）新增「第三方部署（OpenAI 兼容）」一节：逐层说明哪些能力通用、哪些是官方专属，附 `models.json` 配置样例，并点出两条第三方宿主特有的坑——（a）自建引擎的 prefix cache 通常**按实例**，一次 miss 可能是 router 把你换到了另一个副本，而不是前缀被改写，破坏诊断分不出这两者；（b）计费跟随宿主，节省额只信任你在目录里填的 `cost`。
+- INSTALL.md：安装后配置从「DeepSeek API Key」改为「配置模型」，同时覆盖官方 provider 与第三方 OpenAI 兼容 provider。
+- docs/prefix-cache-principle.md：§4.3 计价实现、§7.3 遥测、§7.4 摘要器路由同步改写；§5 破坏因素新增「实例漂移」一行。
+
+### 测试
+
+- 28 → **80**（70 单元 + 10 集成）。新增 R16（第三方计价与分桶：目录价、不折半、unpriced、目录查询抛错、分桶与全部模型累计、底栏口径、弹窗高度上界、v1→v2 迁移、v2 读回与非法桶）与 R17（摘要器解析：当前模型已是 flash 档时直接用、非 flash 档时选当前 provider 的 flash 档、退回当前模型、失败提示带模型名、摘要缓存记录产出模型）。
+
 ## v0.4.0：对齐 pi 1.2.x 宿主 API、DeepSeek 现行口径与双语 UI
 
 > 本次为**修复 + 新增**混合版本，因此用 minor 号：除了三类实质修复，还合入了双语 UI（#11，@François Chaix）与四项开发依赖升级。

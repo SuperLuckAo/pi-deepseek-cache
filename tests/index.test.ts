@@ -1,13 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 
+// 与 vitest.config.ts 的 PI_DEEPSEEK_CACHE_DIR 保持一致：测试绝不碰用户真实的统计目录
+const STATS_DIR =
+  process.env.PI_DEEPSEEK_CACHE_DIR ??
+  join(homedir(), ".pi", "agent", "extensions", "deepseek-cache");
+
 function clearPersistedData() {
-  const dir = join(homedir(), ".pi", "agent", "extensions", "deepseek-cache");
   ["stats.json", "history.json", "summary-cache.json"].forEach((f) => {
-    const p = join(dir, f);
+    const p = join(STATS_DIR, f);
     if (existsSync(p)) unlinkSync(p);
   });
 }
@@ -68,8 +72,23 @@ const mockCtx = {
     notify: vi.fn(),
     custom: vi.fn().mockResolvedValue(undefined),
   },
-  modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn(), complete: completeMock },
+  // 宿主当前模型（虚拟模型 / 路由模型下用于回退取价与选摘要器）
+  model: undefined as { id: string; provider: string; cost?: Record<string, number> } | undefined,
+  modelRegistry: {
+    find: vi.fn(),
+    getModelsOfType: vi.fn(() => [] as Array<{ id: string; provider: string }>),
+    getApiKeyAndHeaders: vi.fn(),
+    complete: completeMock,
+  },
 };
+
+/** 每个用例开头把共享 mock 恢复成干净状态（find/getModelsOfType/current model 会被各用例改写） */
+function resetMockCtx() {
+  mockCtx.modelRegistry.find.mockReset();
+  mockCtx.modelRegistry.getModelsOfType.mockReset();
+  mockCtx.modelRegistry.getModelsOfType.mockReturnValue([]);
+  mockCtx.model = undefined;
+}
 
 /** 取某个事件的监听器 */
 function listenerFor(api: ReturnType<typeof createMockExtensionAPI>, event: string): Listener {
@@ -80,8 +99,8 @@ function listenerFor(api: ReturnType<typeof createMockExtensionAPI>, event: stri
   return fn as Listener;
 }
 
-/** 执行 /cache-stats 并返回弹窗的纯文本渲染结果 */
-async function renderStats(api: ReturnType<typeof createMockExtensionAPI>): Promise<string> {
+/** 执行 /cache-stats 并返回弹窗的渲染行 */
+async function renderStatsLines(api: ReturnType<typeof createMockExtensionAPI>): Promise<string[]> {
   await api.__getCommand("cache-stats")!.handler([], mockCtx);
   const factory = mockCtx.ui.custom.mock.calls.at(-1)![0] as (
     tui: unknown,
@@ -89,9 +108,12 @@ async function renderStats(api: ReturnType<typeof createMockExtensionAPI>): Prom
     kb: unknown,
     done: () => void,
   ) => { render: (w: number) => string[] };
-  return factory(undefined, stubTheme, undefined, () => {})
-    .render(120)
-    .join("\n");
+  return factory(undefined, stubTheme, undefined, () => {}).render(120);
+}
+
+/** 执行 /cache-stats 并返回弹窗的纯文本渲染结果 */
+async function renderStats(api: ReturnType<typeof createMockExtensionAPI>): Promise<string> {
+  return (await renderStatsLines(api)).join("\n");
 }
 
 const PREFIX_BREAK_WARNING = "缓存前缀变化";
@@ -541,9 +563,9 @@ describe("R13: 官方定价", () => {
   // 2026-01-03 为周六，任何时刻均为谷值
   const OFF_PEAK = "2026-01-03T02:00:00Z";
 
-  const emit = (model: string, cacheRead: number, input: number) =>
+  const emit = (model: string, cacheRead: number, input: number, provider = "deepseek") =>
     api.__emit("message_end", {
-      message: { role: "assistant", model, usage: { cacheRead, input, cacheWrite: 0 } },
+      message: { role: "assistant", provider, model, usage: { cacheRead, input, cacheWrite: 0 } },
     });
 
   it("flash 峰值按 $0.006 / $0.30 计价", async () => {
@@ -685,6 +707,7 @@ describe("R13: 官方定价", () => {
     await api.__emit("message_end", {
       message: {
         role: "assistant",
+        provider: "deepseek",
         model: "deepseek-v4-flash",
         usage: { cacheRead: 10, input: 10, cacheWrite: 5 },
       },
@@ -855,5 +878,285 @@ describe("R15: 摘要器模型名", () => {
       expect.stringContaining("找不到摘要模型"),
       "warning",
     );
+  });
+});
+
+// ═══ R16: 第三方部署（模型目录计价 + 按模型分桶）═══
+// 背景：第三方部署（router / 自建 OpenAI 兼容端点）服务的是同一个 DeepSeek 模型，
+// 但既不在 provider id `deepseek` 上，也不适用官方峰谷价；v0.4 的硬编码价目表会把
+// 节省额算错一半，且扁平累计会把不同模型的单价混在一起。
+describe("R16: 第三方部署计价与分桶", () => {
+  let api: ReturnType<typeof createMockExtensionAPI>;
+  // 2026-01-05（周一）02:00 UTC 落在官方峰值窗口内；2026-01-03（周六）任何时刻均为谷值
+  const PEAK = "2026-01-05T02:00:00Z";
+  const OFF_PEAK = "2026-01-03T02:00:00Z";
+
+  /** 第三方（magpie → Open Design）镜像：目录价缓存命中 $0.003 / 未命中 $0.15 */
+  const THIRD_PARTY_MODEL = {
+    id: "open-design/deepseek-v4.1-flash",
+    provider: "magpie",
+    cost: { input: 0.15, output: 0.28, cacheRead: 0.003, cacheWrite: 0 },
+  };
+
+  beforeEach(() => {
+    clearPersistedData();
+    resetMockCtx();
+    mockCtx.ui.notify.mockClear();
+    mockCtx.ui.custom.mockClear();
+    mockCtx.ui.setStatus.mockClear();
+    completeMock.mockReset();
+    api = createMockExtensionAPI();
+    index(asApi(api));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  const emitThirdParty = (cacheRead: number, input: number, model = THIRD_PARTY_MODEL.id) =>
+    api.__emit("message_end", {
+      message: {
+        role: "assistant",
+        provider: THIRD_PARTY_MODEL.provider,
+        model,
+        usage: { cacheRead, input, cacheWrite: 0 },
+      },
+    });
+
+  it("第三方 provider 取模型目录价，且不做峰谷折半（谷值时刻同样是 flat 价）", async () => {
+    mockCtx.modelRegistry.find.mockReturnValue(THIRD_PARTY_MODEL);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(OFF_PEAK));
+    await emitThirdParty(1_000_000, 0);
+    const out = await renderStats(api);
+    expect(out).toContain("模型目录价");
+    expect(out).not.toContain("谷值时段");
+    expect(out).toContain("hit $0.003 / miss $0.15 per 1M");
+    expect(out).toContain("$0.147"); // 1M × (0.15 − 0.003)，未被折半
+  });
+
+  it("第三方 provider 在峰值窗口用同一份 flat 价（无 peak 概念）", async () => {
+    mockCtx.modelRegistry.find.mockReturnValue(THIRD_PARTY_MODEL);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(PEAK));
+    await emitThirdParty(1_000_000, 0);
+    const out = await renderStats(api);
+    expect(out).toContain("模型目录价");
+    expect(out).not.toContain("峰值时段");
+    expect(out).toContain("hit $0.003 / miss $0.15 per 1M");
+  });
+
+  // 回归：v0.4 只有一个「未知模型 → 取 flash 谷值」的兜底，会把免费模型算出一笔节省。
+  it("目录明确给零价时不估算节省，也不展示单价行", async () => {
+    mockCtx.modelRegistry.find.mockReturnValue({
+      id: "amd/Gemma-4-31B-IT",
+      provider: "magpie",
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    await emitThirdParty(10, 10, "amd/Gemma-4-31B-IT");
+    const out = await renderStats(api);
+    expect(out).toContain("模型目录未标价");
+    expect(out).toContain("—（无输入单价）");
+    expect(out).not.toContain("per 1M");
+  });
+
+  it("目录查不到且模型名不匹配官方表时取保守下界", async () => {
+    await emitThirdParty(1_000_000, 0, "amd/Some-Model");
+    const out = await renderStats(api);
+    expect(out).toContain("保守下界");
+    expect(out).toContain("hit $0.003 / miss $0.15 per 1M");
+  });
+
+  it("目录查询抛错时不影响统计展示", async () => {
+    mockCtx.modelRegistry.find.mockImplementation(() => {
+      throw new Error("registry boom");
+    });
+    await emitThirdParty(1_000_000, 0);
+    const out = await renderStats(api);
+    expect(out).toContain("保守下界");
+    expect(out).toContain("1,000,000 tokens");
+  });
+
+  it("按模型分桶：命中率各自独立，并另给全部模型累计", async () => {
+    mockCtx.modelRegistry.find.mockReturnValue(THIRD_PARTY_MODEL);
+    await emitThirdParty(90, 10);
+    await emitThirdParty(10, 90, "antigravity/gemini-3.8-flash");
+    const out = await renderStats(api);
+    expect(out).toContain("按模型（2）");
+    expect(out).toContain("全部模型累计");
+    expect(out).toContain("10.0%"); // 当前模型（后发的 gemini）
+    expect(out).toContain("90.0%"); // 另一个模型
+    expect(out).toContain("50.0% · 2t"); // 全部模型累计
+  });
+
+  it("底栏只反映当前模型，不混入其他模型", async () => {
+    await emitThirdParty(90, 10);
+    expect(mockCtx.ui.setStatus).toHaveBeenLastCalledWith("cache", "cache 90.0% · 1t");
+    mockCtx.modelRegistry.find.mockReturnValue(THIRD_PARTY_MODEL);
+    await emitThirdParty(10, 90, "antigravity/gemini-3.8-flash");
+    expect(mockCtx.ui.setStatus).toHaveBeenLastCalledWith("cache", "cache 10.0% · 1t");
+  });
+
+  it("按模型列表最多 3 行，弹窗高度有界", async () => {
+    for (const m of ["a/one", "b/two", "c/three", "d/four", "e/five"]) {
+      await emitThirdParty(1, 1, m);
+    }
+    const out = await renderStats(api);
+    expect(out).toContain("按模型（5）");
+    expect(out).toContain("还有 2 个模型");
+    expect((await renderStatsLines(api)).length).toBeLessThanOrEqual(22);
+  });
+
+  it("v0.4 的扁平 stats.json 归入「未知模型」桶，不静默清零", async () => {
+    mkdirSync(STATS_DIR, { recursive: true });
+    writeFileSync(
+      join(STATS_DIR, "stats.json"),
+      JSON.stringify({ cacheRead: 300, input: 100, cacheWrite: 0, turns: 4 }),
+    );
+    api = createMockExtensionAPI();
+    index(asApi(api));
+    const out = await renderStats(api);
+    expect(out).toContain("未知模型");
+    expect(out).toContain("75.0%"); // 300 / (300 + 100)
+    expect(out).toContain("4t");
+  });
+
+  it("v2 stats.json 按桶读回（provider/id 展示名）", async () => {
+    mkdirSync(STATS_DIR, { recursive: true });
+    writeFileSync(
+      join(STATS_DIR, "stats.json"),
+      JSON.stringify({
+        version: 2,
+        byModel: [
+          {
+            key: "magpie/x",
+            provider: "magpie",
+            id: "x",
+            cacheRead: 80,
+            input: 20,
+            cacheWrite: 0,
+            turns: 3,
+          },
+        ],
+      }),
+    );
+    api = createMockExtensionAPI();
+    index(asApi(api));
+    const out = await renderStats(api);
+    expect(out).toContain("magpie/x");
+    expect(out).toContain("80.0%");
+    expect(out).toContain("3t");
+  });
+
+  it("v2 读盘跳过非法桶并归一化负值", async () => {
+    mkdirSync(STATS_DIR, { recursive: true });
+    writeFileSync(
+      join(STATS_DIR, "stats.json"),
+      JSON.stringify({
+        version: 2,
+        byModel: [
+          null,
+          "junk",
+          { key: "magpie/y", provider: "magpie", id: "y", cacheRead: -5, input: 10, turns: 1 },
+        ],
+      }),
+    );
+    api = createMockExtensionAPI();
+    index(asApi(api));
+    const out = await renderStats(api);
+    expect(out).toContain("magpie/y");
+    expect(out).toContain("1t");
+    expect(out).not.toContain("NaN");
+  });
+});
+
+// ═══ R17: 摘要器 provider 无关（第三方部署下 P3 不再是死代码）═══
+describe("R17: 摘要器模型解析", () => {
+  let api: ReturnType<typeof createMockExtensionAPI>;
+  let compact: Listener;
+  let n = 0;
+
+  beforeEach(() => {
+    clearPersistedData();
+    resetMockCtx();
+    mockCtx.ui.notify.mockClear();
+    mockCtx.modelRegistry.getApiKeyAndHeaders.mockResolvedValue({
+      ok: true,
+      apiKey: "sk-test",
+      headers: {},
+    });
+    completeMock.mockReset();
+    api = createMockExtensionAPI();
+    index(asApi(api));
+    compact = listenerFor(api, "session_before_compact");
+  });
+
+  const run = (content = `uniq-r17-${n++}`) =>
+    compact(
+      {
+        preparation: {
+          messagesToSummarize: [{ role: "user", content }],
+          firstKeptEntryId: "e1",
+          tokensBefore: 10,
+          previousSummary: "",
+        },
+        signal: new AbortController().signal,
+      },
+      mockCtx,
+    );
+
+  it("当前模型本身就是 flash 档时直接用当前模型（不做意外路由）", async () => {
+    mockCtx.modelRegistry.find.mockReturnValue(null);
+    mockCtx.model = { id: "open-design/deepseek-v4.1-flash", provider: "magpie" };
+    mockCtx.modelRegistry.getModelsOfType.mockReturnValue([
+      { id: "amd/DeepSeek-V4.1-Flash", provider: "magpie" },
+      { id: "amd/GLM-5.3-Flash", provider: "magpie" },
+    ]);
+    completeMock.mockResolvedValueOnce(completion("s-same"));
+    const r = await run();
+    expect(r.compaction.details.summarizer).toBe("open-design/deepseek-v4.1-flash");
+    expect(mockCtx.modelRegistry.getModelsOfType).not.toHaveBeenCalled();
+  });
+
+  it("当前模型不是 flash 档时选当前 provider 的 flash 档（优先含 deepseek）", async () => {
+    mockCtx.modelRegistry.find.mockReturnValue(null);
+    mockCtx.model = { id: "magpie/deepseek-v4.1-pro", provider: "magpie" };
+    mockCtx.modelRegistry.getModelsOfType.mockReturnValue([
+      { id: "stepfun/step-5-preview", provider: "magpie" },
+      { id: "opencode-go/deepseek-v4.1-flash", provider: "magpie" },
+    ]);
+    completeMock.mockResolvedValueOnce(completion("s-third-party"));
+    expect((await run()).compaction.details.summarizer).toBe("opencode-go/deepseek-v4.1-flash");
+  });
+
+  it("当前 provider 无 flash 档时退回当前模型", async () => {
+    mockCtx.modelRegistry.find.mockReturnValue(null);
+    mockCtx.model = { id: "magpie/some-pro", provider: "magpie" };
+    completeMock.mockResolvedValueOnce(completion("s-current"));
+    expect((await run()).compaction.details.summarizer).toBe("magpie/some-pro");
+  });
+
+  // 回归：截断摘要的告警要能指出是哪个模型失败的（旧实现写死 “flash 摘要”）。
+  it("摘要器为第三方模型时，失败提示带上该模型名", async () => {
+    mockCtx.modelRegistry.find.mockReturnValue(null);
+    mockCtx.model = { id: "magpie/some-pro", provider: "magpie" };
+    completeMock.mockResolvedValueOnce({
+      content: [{ type: "text", text: "partial" }],
+      stopReason: "length",
+    });
+    expect(await run()).toBeUndefined();
+    expect(mockCtx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("magpie/some-pro"),
+      "warning",
+    );
+  });
+
+  it("摘要缓存记录产出模型，命中时 details.summarizer 不再写死", async () => {
+    mockCtx.modelRegistry.find.mockReturnValue(null);
+    mockCtx.model = { id: "magpie/some-pro", provider: "magpie" };
+    completeMock.mockResolvedValueOnce(completion("cached-summary"));
+    const first = await run("fixed-text-r17");
+    completeMock.mockClear();
+    const second = await run("fixed-text-r17");
+    expect(second.compaction.summary).toBe("cached-summary");
+    expect(second.compaction.details.summarizer).toBe(first.compaction.details.summarizer);
+    expect(completeMock).not.toHaveBeenCalled();
   });
 });

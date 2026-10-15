@@ -140,7 +140,7 @@ describe("pi-deepseek-cache 集成测试", () => {
 
       // 检查 P3: Compaction
       expect(content).toContain("summaryCache");
-      expect(content).toContain("summarizeWithFlash");
+      expect(content).toContain("summarizeWithModel");
       expect(content).toContain("temperature: 0");
     });
 

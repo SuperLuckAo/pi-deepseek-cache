@@ -119,10 +119,91 @@ function lookupPricing(model: string | undefined): PriceTier | undefined {
   return undefined;
 }
 
-/** 当前生效单价：按模型取价，再按 peak/off-peak 折半 */
-function currentPricing(model: string | undefined, now: Date): PriceTier {
-  const tier = lookupPricing(model) ?? DEFAULT_PRICING;
-  return isPeakWindow(now) ? tier : { hit: tier.hit / 2, miss: tier.miss / 2 };
+/**
+ * 官方 provider id（pi `KnownProvider` 之一）。peak/off-peak 是**官方计费策略**，
+ * 只对官方端点成立：第三方部署（OpenRouter / 自建 vLLM / 各类 router）即使服务的是
+ * 同一个 DeepSeek 模型，也按自己的 flat 价目表结算，折半会把节省额算错一半。
+ */
+const OFFICIAL_DEEPSEEK_PROVIDER = "deepseek";
+
+/** 单价来源：UI 用它说清「这个数字从哪来」 */
+type PricingSource = "catalog" | "official-table" | "default" | "unpriced";
+
+interface PricingResolution {
+  /** 用于估算节省额的单价；source === "unpriced" 时为零价占位 */
+  tier: PriceTier;
+  source: PricingSource;
+  /** 单价随调用时刻在峰/谷之间折半（仅官方 provider） */
+  peakApplies: boolean;
+  /** 仅当 peakApplies 时有意义 */
+  peak: boolean;
+  /** false = 模型目录明确给了零价（免费 / 未标价），此时不估算节省额，避免编造数字 */
+  available: boolean;
+}
+
+/** 模型目录里的 cost → 单价；缺输入价（免费模型 / 未标价）返回 undefined */
+function costToTier(
+  cost: { input?: number; cacheRead?: number } | undefined,
+): PriceTier | undefined {
+  if (!cost) return undefined;
+  const miss = cost.input ?? 0;
+  if (!(miss > 0)) return undefined;
+  return { hit: Math.max(0, cost.cacheRead ?? 0), miss };
+}
+
+/**
+ * 计价解析顺序（v0.5 起）：
+ * 1. **模型目录的 cost**（`models.json` / pi 内置目录）—— 第三方部署的唯一真源；
+ * 2. 官方价目表（按模型 id，含 legacy 名与已停用名）—— 官方用户与自建代理的兜底；
+ * 3. 目录有该模型但零价 → unpriced：不估算，避免把免费模型算出一笔「节省」；
+ * 4. 目录完全没有该模型 → 官方 flash 谷值作保守下界（沿用 v0.4 行为，宁少不多）。
+ *
+ * 峰谷折半只在官方 provider 上生效；其余一律按目录里的 flat 价。
+ */
+function resolvePricing(
+  ref: ModelRef | undefined,
+  cost: { input?: number; cacheRead?: number } | undefined,
+  now: Date,
+): PricingResolution {
+  const official = ref?.provider === OFFICIAL_DEEPSEEK_PROVIDER;
+  const catalogTier = costToTier(cost);
+  const tableTier = lookupPricing(ref?.id);
+
+  let tier: PriceTier;
+  let source: PricingSource;
+  if (catalogTier) {
+    tier = catalogTier;
+    source = "catalog";
+  } else if (tableTier) {
+    tier = tableTier;
+    source = "official-table";
+  } else if (cost) {
+    tier = { hit: 0, miss: 0 };
+    source = "unpriced";
+  } else {
+    tier = DEFAULT_PRICING;
+    source = "default";
+  }
+
+  const peak = official && isPeakWindow(now);
+  if (official && !peak) tier = { hit: tier.hit / 2, miss: tier.miss / 2 };
+  return { tier, source, peakApplies: official, peak, available: source !== "unpriced" };
+}
+
+/** 把计价来源渲染成一段人类可读的标签（含峰谷时段判定） */
+function pricingSourceLabel(p: PricingResolution): string {
+  switch (p.source) {
+    case "catalog":
+      return strings.pricingSourceCatalog;
+    case "official-table":
+      return p.peakApplies
+        ? `${strings.pricingSourceTable} · ${p.peak ? strings.peak : strings.offPeak}`
+        : strings.pricingSourceTable;
+    case "unpriced":
+      return strings.pricingSourceUnpriced;
+    default:
+      return strings.pricingSourceDefault;
+  }
 }
 
 const MAX_SUMMARY_CACHE = 64;
@@ -156,14 +237,23 @@ const STRINGS = {
     cacheWrites: "Cache writes",
     turns: "Turns",
     estimatedSavings: "Estimated savings",
+    savingsUnavailable: "— (no input price)",
     lastTurnHitRate: "Last turn hit rate",
     unknownModel: "unknown model",
+    allModels: "All models",
+    byModelHeading: (count: number) => `By model (${count})`,
+    moreModels: (count: number) => `… ${count} more model(s)`,
     peak: "peak hours",
     offPeak: "off-peak hours",
-    pricingLine: (model: string, tier: string) => `Pricing ${model} · ${tier}`,
+    pricingSourceCatalog: "model catalog rate",
+    pricingSourceTable: "official price table",
+    pricingSourceDefault: "conservative floor (no price data)",
+    pricingSourceUnpriced: "no price in model catalog",
+    pricingLine: (model: string, source: string) => `Pricing ${model} · ${source}`,
     close: "Esc Close",
-    graphTitle: "⚡ Cache Hit Rate Trend",
-    graphTitleWithPoints: (count: number) => `⚡ Cache Hit Rate Trend (${count} data points)`,
+    graphTitle: "⚡ Cache Hit Rate Trend (all models)",
+    graphTitleWithPoints: (count: number) =>
+      `⚡ Cache Hit Rate Trend · all models (${count} data points)`,
     noData: "No hit-rate data yet",
     keepChatting: "Continue for a few turns first",
     statsDescription: "DeepSeek prefix cache hit rate",
@@ -175,11 +265,13 @@ const STRINGS = {
     previousSummary: "Previous summary",
     newHistory: "New history",
     modelMissing: (candidates: string) =>
-      `Summary model not found (${candidates}); falling back to default compaction`,
-    authFailed: (error: string) =>
-      `Summary auth failed (${error}); falling back to default compaction`,
+      `No summarizer model available (tried ${candidates}, then the current provider's flash model, then the current model); falling back to default compaction`,
+    authFailed: (model: string, error: string) =>
+      `Summarizer auth failed for ${model} (${error}); falling back to default compaction`,
     summaryFailed: (message: string) =>
-      `Flash summary failed: ${message}; falling back to default compaction`,
+      `Summary failed (${message}); falling back to default compaction`,
+    summaryUnknownError: "unknown error",
+    summaryTruncated: "hit the token cap, so the summary is incomplete",
     summaryPrompt:
       "Compress the following conversation history into a structured Markdown summary covering: " +
       "goals, key decisions and rationale, code/file changes, current progress, blockers and unresolved questions, and next steps. " +
@@ -205,14 +297,22 @@ const STRINGS = {
     cacheWrites: "缓存写入",
     turns: "对话轮次",
     estimatedSavings: "预估节省",
+    savingsUnavailable: "—（无输入单价）",
     lastTurnHitRate: "本轮命中率",
     unknownModel: "未知模型",
-    peak: "峰值",
-    offPeak: "谷值",
-    pricingLine: (model: string, tier: string) => `计价 ${model} · ${tier}时段`,
+    allModels: "全部模型累计",
+    byModelHeading: (count: number) => `按模型（${count}）`,
+    moreModels: (count: number) => `… 还有 ${count} 个模型`,
+    peak: "峰值时段",
+    offPeak: "谷值时段",
+    pricingSourceCatalog: "模型目录价",
+    pricingSourceTable: "官方价目表",
+    pricingSourceDefault: "保守下界（无价目数据）",
+    pricingSourceUnpriced: "模型目录未标价",
+    pricingLine: (model: string, source: string) => `计价 ${model} · ${source}`,
     close: "Esc 关闭",
-    graphTitle: "⚡ 缓存命中率趋势",
-    graphTitleWithPoints: (count: number) => `⚡ 缓存命中率趋势 (${count} 个数据点)`,
+    graphTitle: "⚡ 缓存命中率趋势（全部模型）",
+    graphTitleWithPoints: (count: number) => `⚡ 缓存命中率趋势 · 全部模型 (${count} 个数据点)`,
     noData: "暂无命中率数据",
     keepChatting: "请先进行多轮对话",
     statsDescription: "DeepSeek 前缀缓存命中率",
@@ -222,9 +322,13 @@ const STRINGS = {
     prefixChanged: (count: number) => `检测到缓存前缀变化（第 ${count} 次），本轮可能未命中缓存`,
     previousSummary: "上次摘要",
     newHistory: "新增历史",
-    modelMissing: (candidates: string) => `找不到摘要模型（${candidates}）,回退默认 compaction`,
-    authFailed: (error: string) => `flash 摘要鉴权失败（${error}）,回退默认 compaction`,
-    summaryFailed: (message: string) => `flash 摘要失败:${message},回退默认 compaction`,
+    modelMissing: (candidates: string) =>
+      `找不到摘要模型（依次尝试 ${candidates} / 当前 provider 的 flash 档 / 当前模型）；回退默认 compaction`,
+    authFailed: (model: string, error: string) =>
+      `摘要模型 ${model} 鉴权失败（${error}）；回退默认 compaction`,
+    summaryFailed: (message: string) => `摘要失败（${message}）；回退默认 compaction`,
+    summaryUnknownError: "未知错误",
+    summaryTruncated: "生成触达 token 上限，摘要不完整",
     summaryPrompt:
       "把下面这段对话历史压缩成结构化 markdown 摘要,覆盖:" +
       "①目标 ②关键决策与理由 ③代码/文件改动 ④当前进度 ⑤堵塞与未决问题 ⑥后续步骤。" +
@@ -242,11 +346,43 @@ const strings = STRINGS[resolveLanguage()];
 
 // ───────── R9: 局部类型定义，消除 any ─────────
 
-interface PersistedStats {
+/** 归一化后的模型引用：provider + 目录 id（两者都可能缺失，例如 v0.4 的旧数据） */
+interface ModelRef {
+  provider?: string;
+  id?: string;
+}
+
+/** 计数四元组（视图与全局累计用） */
+interface ModelStats {
   cacheRead: number;
   input: number;
   cacheWrite: number;
   turns: number;
+}
+
+/**
+ * 单模型累计桶。v0.5 起统计按模型分桶：多模型（或同一会话中途切模型 / 走 router 的
+ * 多后端）共用一个扁平累计时，命中率与节省额会互相污染，而两者单价可能差几十倍。
+ */
+interface ModelBucket extends ModelStats {
+  /** 分桶键：`provider/id`；缺 provider 或 id 时退化为可用的一半或 UNKNOWN_MODEL_KEY */
+  key: string;
+  provider?: string;
+  id?: string;
+  /** 该模型是否上报过非零 cache write（官方 usage 无此字段，故按模型分别判定） */
+  cacheWriteReported?: boolean;
+}
+
+/** stats.json 的当前形态（v2）。v1 的扁平累计在读取时归入 unknown 桶，不丢数据。 */
+interface PersistedStats {
+  version: 2;
+  byModel: ModelBucket[];
+}
+
+/** summary-cache.json 的值：记下产出该摘要的模型，便于 `details.summarizer` 说真话 */
+interface SummaryCacheEntry {
+  summary: string;
+  model: string;
 }
 
 interface HistoryPoint {
@@ -255,16 +391,23 @@ interface HistoryPoint {
   timestamp: number;
 }
 
-/** /cache-stats 渲染所需的完整视图（统计 + 单轮 + 计价上下文） */
+/** /cache-stats 渲染所需的完整视图（当前模型 + 全部模型累计 + 计价上下文） */
 interface StatsView {
-  stats: PersistedStats;
+  /** 当前模型桶（尚未观测到任何消息时为零值） */
+  stats: ModelStats;
+  /** 当前模型的 provider/id，用于计价 */
+  ref: ModelRef | undefined;
+  /** 当前模型展示名（provider/id） */
+  modelLabel: string;
+  /** 全部模型累计 */
+  totals: ModelStats;
+  totalsHitRate: number;
+  /** 全部模型桶，按 token 量降序 */
+  byModel: ModelBucket[];
   /** 最近一轮的命中率；尚无 assistant 消息时为 undefined */
   lastTurnHitRate: number | undefined;
-  /** 当前生效的 wire model，用于选价并显示 */
-  model: string | undefined;
-  pricing: PriceTier;
-  peak: boolean;
-  /** 官方 usage 只有 hit/miss，不提供 cache write；仅在确实观测到非零写入时才展示该行 */
+  pricing: PricingResolution;
+  /** 当前模型桶是否上报过非零 cache write */
   reportsCacheWrite: boolean;
 }
 
@@ -298,6 +441,24 @@ function getToolName(t: unknown): string {
   if (fn && typeof fn.name === "string") return fn.name;
   return "";
 }
+
+/** R2: 单一命中率计算函数 */
+function calcHitRate(read: number, miss: number): number {
+  return read + miss ? (read / (read + miss)) * 100 : 0;
+}
+
+/** 按显示宽度截断标签（CJK 占 2 列），超出时以 … 收尾 */
+function fitLabel(text: string, budget: number): string {
+  if (budget <= 0) return "";
+  if (visibleWidth(text) <= budget) return text;
+  let out = "";
+  // 预留 1 列给省略号
+  for (const ch of text) {
+    if (visibleWidth(out + ch) > budget - 1) break;
+    out += ch;
+  }
+  return out + "…";
+}
 function ensureStatsDir() {
   if (!existsSync(STATS_DIR)) mkdirSync(STATS_DIR, { recursive: true });
 }
@@ -307,7 +468,7 @@ function atomicWriteJson(path: string, data: unknown) {
   writeFileSync(tmp, JSON.stringify(data, null, 2));
   renameSync(tmp, path);
 }
-function setSummaryCache(cache: Map<string, string>, k: string, v: string) {
+function setSummaryCache(cache: Map<string, SummaryCacheEntry>, k: string, v: SummaryCacheEntry) {
   cache.set(k, v);
   if (cache.size > MAX_SUMMARY_CACHE) {
     const first = cache.keys().next().value as string | undefined;
@@ -319,24 +480,122 @@ function setSummaryCache(cache: Map<string, string>, k: string, v: string) {
 //  持久化存储
 // ═══════════════════════════════════════════════════════════════════════════
 
-const STATS_DIR = join(homedir(), ".pi", "agent", "extensions", "deepseek-cache");
+/**
+ * 数据目录。默认 `~/.pi/agent/extensions/deepseek-cache`；
+ * `PI_DEEPSEEK_CACHE_DIR` 可覆盖它 —— 测试与临时隔离环境靠这个避免写/删用户的真实统计。
+ */
+const STATS_DIR =
+  process.env.PI_DEEPSEEK_CACHE_DIR ||
+  join(homedir(), ".pi", "agent", "extensions", "deepseek-cache");
 const STATS_FILE = join(STATS_DIR, "stats.json");
 const HISTORY_FILE = join(STATS_DIR, "history.json");
 const SUMMARY_CACHE_FILE = join(STATS_DIR, "summary-cache.json"); // R12
 
+/** v0.4 及更早的扁平累计（无模型维度）被归入该桶 */
+const UNKNOWN_MODEL_KEY = "unknown";
+/** /cache-stats 最多渲染几个模型行（弹窗不滚动，必须守住高度） */
+const MAX_BUCKET_ROWS = 3;
+
 // Module-level ctx reference for persistence error reporting
 let extensionCtx: ExtensionContext | undefined;
 
+/** 读盘数值归一化：非有限正数一律按 0 处理 */
+function num(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+/**
+ * 分桶键 `provider/id`。模型 id 自身可能含 `/`（如 `open-design/deepseek-v4.1-flash`），
+ * 因此键不能被反向拆开——provider 与 id 另行存字段。
+ */
+function bucketKey(provider: string | undefined, id: string | undefined): string {
+  if (provider && id) return `${provider}/${id}`;
+  return id ?? provider ?? UNKNOWN_MODEL_KEY;
+}
+
+/** 展示名 `provider/id`（与 pi 的 `--model provider/id` 保持一致） */
+function modelLabelOf(provider: string | undefined, id: string | undefined): string {
+  if (provider && id) return `${provider}/${id}`;
+  return id ?? provider ?? strings.unknownModel;
+}
+
+function emptyBucket(provider: string | undefined, id: string | undefined): ModelBucket {
+  return {
+    key: bucketKey(provider, id),
+    provider,
+    id,
+    cacheRead: 0,
+    input: 0,
+    cacheWrite: 0,
+    turns: 0,
+  };
+}
+
+function sumStats(buckets: Iterable<ModelBucket>): ModelStats {
+  const total: ModelStats = { cacheRead: 0, input: 0, cacheWrite: 0, turns: 0 };
+  for (const b of buckets) {
+    total.cacheRead += b.cacheRead;
+    total.input += b.input;
+    total.cacheWrite += b.cacheWrite;
+    total.turns += b.turns;
+  }
+  return total;
+}
+
+/**
+ * 读盘归一化：
+ * - v2（`byModel` 数组）：逐桶校验，非法项丢弃；
+ * - v1 及更早（扁平累计，无模型维度）：归入 unknown 桶而不是丢弃 —— 旧数据没有模型
+ *   信息，宁可标成「未知模型」也不要静默清零；
+ * - 无法识别：空。
+ */
+function normalizeStats(raw: unknown): PersistedStats {
+  if (!raw || typeof raw !== "object") return { version: 2, byModel: [] };
+  const o = raw as Record<string, unknown>;
+
+  if (o.version === 2 && Array.isArray(o.byModel)) {
+    const byModel: ModelBucket[] = [];
+    for (const item of o.byModel) {
+      if (!item || typeof item !== "object") continue;
+      const b = item as Record<string, unknown>;
+      const provider = typeof b.provider === "string" ? b.provider : undefined;
+      const id = typeof b.id === "string" ? b.id : undefined;
+      byModel.push({
+        key: typeof b.key === "string" && b.key ? b.key : bucketKey(provider, id),
+        provider,
+        id,
+        cacheRead: num(b.cacheRead),
+        input: num(b.input),
+        cacheWrite: num(b.cacheWrite),
+        turns: num(b.turns),
+        ...(b.cacheWriteReported === true ? { cacheWriteReported: true } : {}),
+      });
+    }
+    return { version: 2, byModel };
+  }
+
+  const legacy: ModelBucket = {
+    ...emptyBucket(undefined, undefined),
+    cacheRead: num(o.cacheRead),
+    input: num(o.input),
+    cacheWrite: num(o.cacheWrite),
+    turns: num(o.turns),
+  };
+  const hasData = legacy.cacheRead + legacy.input + legacy.cacheWrite + legacy.turns > 0;
+  return { version: 2, byModel: hasData ? [legacy] : [] };
+}
+
 function loadStats(): PersistedStats {
   try {
-    if (existsSync(STATS_FILE)) return JSON.parse(readFileSync(STATS_FILE, "utf-8"));
+    if (existsSync(STATS_FILE))
+      return normalizeStats(JSON.parse(readFileSync(STATS_FILE, "utf-8")));
   } catch (err) {
     if (extensionCtx) {
       const msg = err instanceof Error ? err.message : String(err);
       extensionCtx.ui.notify(strings.statsParseFailed(msg), "warning");
     }
   }
-  return { cacheRead: 0, input: 0, cacheWrite: 0, turns: 0 };
+  return { version: 2, byModel: [] };
 }
 
 // R8: 异步节流写入 — 合并高频调用，减少同步 I/O 阻塞
@@ -449,11 +708,26 @@ function saveHistory(h: Array<{ turn: number; hitRate: number; timestamp: number
 }
 
 // R12: 摘要缓存落盘 — 跨会话复用
-function loadSummaryCache(): Map<string, string> {
+// 值形态：v0.5 起为 { summary, model }；v0.4 及更早是裸字符串（模型未知）。
+function loadSummaryCache(): Map<string, SummaryCacheEntry> {
   try {
     if (existsSync(SUMMARY_CACHE_FILE)) {
-      const data: Record<string, string> = JSON.parse(readFileSync(SUMMARY_CACHE_FILE, "utf-8"));
-      return new Map(Object.entries(data));
+      const data: Record<string, unknown> = JSON.parse(readFileSync(SUMMARY_CACHE_FILE, "utf-8"));
+      const cache = new Map<string, SummaryCacheEntry>();
+      for (const [k, v] of Object.entries(data)) {
+        if (typeof v === "string") {
+          cache.set(k, { summary: v, model: strings.unknownModel });
+        } else if (v && typeof v === "object") {
+          const e = v as { summary?: unknown; model?: unknown };
+          if (typeof e.summary === "string") {
+            cache.set(k, {
+              summary: e.summary,
+              model: typeof e.model === "string" ? e.model : strings.unknownModel,
+            });
+          }
+        }
+      }
+      return cache;
     }
   } catch (err) {
     if (extensionCtx) {
@@ -464,9 +738,9 @@ function loadSummaryCache(): Map<string, string> {
   return new Map();
 }
 
-function saveSummaryCache(cache: Map<string, string>) {
+function saveSummaryCache(cache: Map<string, SummaryCacheEntry>) {
   try {
-    const obj: Record<string, string> = {};
+    const obj: Record<string, SummaryCacheEntry> = {};
     for (const [k, v] of cache) obj[k] = v;
     atomicWriteJson(SUMMARY_CACHE_FILE, obj);
   } catch (err) {
@@ -503,7 +777,17 @@ class CacheStatsOverlay implements Focusable {
   }
 
   render(_width: number): string[] {
-    const { stats, lastTurnHitRate, model, pricing, peak, reportsCacheWrite } = this.view;
+    const {
+      stats,
+      ref,
+      modelLabel,
+      totals,
+      totalsHitRate,
+      byModel,
+      lastTurnHitRate,
+      pricing,
+      reportsCacheWrite,
+    } = this.view;
     const { cacheRead, input, cacheWrite, turns } = stats;
     const th = this.theme;
     const w = this.width;
@@ -511,14 +795,20 @@ class CacheStatsOverlay implements Focusable {
 
     // 官方口径 prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens；
     // pi-ai 的 usage.input 已是不相交的 miss 部分，故 hit/(hit+miss) 即命中率。
-    // 此处为跨轮累计值（官方按请求逐次统计），另单独展示本轮值。
-    const cumulative = cacheRead + input ? (cacheRead / (cacheRead + input)) * 100 : 0;
-    // 节省额 = 命中部分相对全量 miss 的边际差价，按当前模型 + 当前时段计价
-    // flash 档单价低（谷值 hit $0.003 / miss $0.15），每百万命中仅省 $0.147，
-    // 固定 2 位小数会丢失有效信息，故小额用 4 位、大额用 2 位
-    const savedDollars = (cacheRead / 1_000_000) * (pricing.miss - pricing.hit);
-    const savedStr =
-      savedDollars >= 0.01 ? `$${savedDollars.toFixed(savedDollars < 1 ? 4 : 2)}` : "< $0.01";
+    // 此处为**当前模型**跨轮累计值（官方按请求逐次统计），另单独展示本轮值。
+    const cumulative = calcHitRate(cacheRead, input);
+    // 节省额 = 命中部分相对全量 miss 的边际差价，按当前模型单价计价。
+    // 目录未标价（免费/未定价模型）时不估算：与其编一个数，不如留白。
+    // flash 档单价低，每百万命中仅省 $0.147，固定 2 位小数会丢失有效信息，
+    // 故小额用 4 位、大额用 2 位。
+    const savedDollars = pricing.available
+      ? (cacheRead / 1_000_000) * (pricing.tier.miss - pricing.tier.hit)
+      : 0;
+    const savedStr = !pricing.available
+      ? strings.savingsUnavailable
+      : savedDollars >= 0.01
+        ? `$${savedDollars.toFixed(savedDollars < 1 ? 4 : 2)}`
+        : "< $0.01";
 
     const pad = (s: string) => s + " ".repeat(Math.max(0, inner - visibleWidth(s)));
     const row = (s: string) => th.fg("border", "│") + pad(s) + th.fg("border", "│");
@@ -528,7 +818,7 @@ class CacheStatsOverlay implements Focusable {
       return `  ${th.fg("dim", key)}${th.fg("accent", v)}`;
     };
 
-    const lines = [
+    const lines: string[] = [
       th.fg("border", `╭${"─".repeat(inner)}╮`),
       row(` ${th.fg("accent", strings.statsTitle)}`),
       row(""),
@@ -545,18 +835,41 @@ class CacheStatsOverlay implements Focusable {
     // 官方 usage 仅提供 hit/miss，无 cache write 字段；未观测到写入时隐藏该行
     if (reportsCacheWrite)
       lines.push(row(label(strings.cacheWrites, `${cacheWrite.toLocaleString()} tokens`)));
+    lines.push(row(label(strings.turns, `${turns}`)));
+    // 多模型时才需要一行全局口径，否则它与上面重复
+    if (byModel.length > 1) {
+      lines.push(row(label(strings.allModels, `${totalsHitRate.toFixed(1)}% · ${totals.turns}t`)));
+    }
+    const activeKey = ref ? bucketKey(ref.provider, ref.id) : undefined;
     lines.push(
-      row(label(strings.turns, `${turns}`)),
       row(label(strings.estimatedSavings, savedStr)),
       row(""),
       row(
-        ` ${th.fg("dim", strings.pricingLine(model ?? strings.unknownModel, peak ? strings.peak : strings.offPeak))}`,
+        ` ${th.fg("dim", fitLabel(strings.pricingLine(modelLabel, pricingSourceLabel(pricing)), inner - 2))}`,
       ),
-      row(` ${th.fg("dim", `hit $${pricing.hit} / miss $${pricing.miss} per 1M`)}`),
-      row(""),
-      row(` ${th.fg("dim", strings.close)}`),
-      th.fg("border", `╰${"─".repeat(inner)}╯`),
     );
+    if (pricing.available) {
+      lines.push(
+        row(
+          ` ${th.fg("dim", fitLabel(`hit $${pricing.tier.hit} / miss $${pricing.tier.miss} per 1M`, inner - 2))}`,
+        ),
+      );
+    }
+    if (byModel.length > 0) {
+      lines.push(row(` ${th.fg("dim", strings.byModelHeading(byModel.length))}`));
+      for (const b of byModel.slice(0, MAX_BUCKET_ROWS)) {
+        // 指标宽度固定，模型名按剩余宽度截断，避免撑破边框
+        const metric = `${calcHitRate(b.cacheRead, b.input).toFixed(1)}% · ${b.turns}t`;
+        const name = fitLabel(modelLabelOf(b.provider, b.id), inner - 4 - visibleWidth(metric));
+        // ▸ 标记上方数字属于哪个模型
+        const marker = b.key === activeKey ? "▸ " : "  ";
+        lines.push(row(`${marker}${th.fg("dim", name)} ${th.fg("accent", metric)}`));
+      }
+      if (byModel.length > MAX_BUCKET_ROWS) {
+        lines.push(row(`  ${th.fg("dim", strings.moreModels(byModel.length - MAX_BUCKET_ROWS))}`));
+      }
+    }
+    lines.push(row(` ${th.fg("dim", strings.close)}`), th.fg("border", `╰${"─".repeat(inner)}╯`));
     return lines;
   }
 
@@ -718,18 +1031,17 @@ export default function (pi: ExtensionAPI) {
     extensionCtx = ctx;
   };
 
-  // ───────── P1 命中率遥测(持久化) ─────────
+  // ───────── P1 命中率遥测(持久化、按模型分桶) ─────────
   const persisted = loadStats();
-  let { cacheRead, input, cacheWrite, turns } = persisted;
+  const buckets = new Map<string, ModelBucket>();
+  for (const b of persisted.byModel) buckets.set(b.key, b);
   const hitRateHistory = loadHistory();
   let lastHitRate =
     hitRateHistory.length > 0 ? hitRateHistory[hitRateHistory.length - 1].hitRate : 0;
   /** 最近一轮的 hit/miss，用于展示按请求口径的命中率（官方逐次统计口径） */
   let lastTurn: { read: number; miss: number } | undefined;
-  /** 当前 wire model，用于按官方价目表选价 */
-  let activeModel: string | undefined;
-  /** 官方 usage 无 cache write 字段；仅当观测到非零写入才展示该行 */
-  let reportsCacheWrite = false;
+  /** 当前 wire model（provider + 目录 id），用于选价、展示、分桶 */
+  let activeRef: ModelRef | undefined;
   /** 缓存前缀被改写的累计次数 */
   let prefixBreaks = 0;
   /**
@@ -740,8 +1052,25 @@ export default function (pi: ExtensionAPI) {
   const knownPrefixes: PrefixFingerprint[] = [];
   const MAX_KNOWN_PREFIXES = 8;
 
-  /** R2: 单一命中率计算函数 */
-  const calcHitRate = (r: number, i: number): number => (r + i ? (r / (r + i)) * 100 : 0);
+  const bucketFor = (provider: string | undefined, id: string | undefined): ModelBucket => {
+    const key = bucketKey(provider, id);
+    const existing = buckets.get(key);
+    if (existing) {
+      // 先到的消息可能缺 provider（旧会话 / 自定义消息），后续消息补齐
+      existing.provider = provider ?? existing.provider;
+      existing.id = id ?? existing.id;
+      return existing;
+    }
+    const created = emptyBucket(provider, id);
+    buckets.set(key, created);
+    return created;
+  };
+
+  /** 落盘快照（v2）。深拷贝一层，避免防抖窗口内的后续消息改写即将写入的对象 */
+  const statsSnapshot = (): PersistedStats => ({
+    version: 2,
+    byModel: [...buckets.values()].map((b) => ({ ...b })),
+  });
 
   pi.on("message_end", async (event, ctx) => {
     setExtensionCtx(ctx);
@@ -751,45 +1080,87 @@ export default function (pi: ExtensionAPI) {
     const read = u.cacheRead ?? 0;
     const miss = u.input ?? 0;
     const write = u.cacheWrite ?? 0;
-    if (write > 0) reportsCacheWrite = true;
-    const m = event.message.model;
-    if (typeof m === "string" && m) activeModel = m;
+    const provider = event.message.provider;
+    const modelId =
+      typeof event.message.model === "string" && event.message.model
+        ? event.message.model
+        : undefined;
+    if (modelId) activeRef = { provider, id: modelId };
+    // v0.5: 按模型分桶累计——切模型 / router 多后端下命中率与单价差异极大，不能混算
+    const bucket = bucketFor(provider, modelId);
     lastTurn = { read, miss };
-    cacheRead += read;
-    input += miss;
-    cacheWrite += write;
-    turns += 1;
+    bucket.cacheRead += read;
+    bucket.input += miss;
+    bucket.cacheWrite += write;
+    bucket.turns += 1;
+    if (write > 0) bucket.cacheWriteReported = true;
 
-    scheduleSaveStats({ cacheRead, input, cacheWrite, turns });
+    scheduleSaveStats(statsSnapshot());
 
-    // R2: 计算一次，复用于状态栏与历史
-    const rate = calcHitRate(cacheRead, input);
-    ctx.ui.setStatus("cache", `cache ${rate.toFixed(1)}% · ${turns}t`);
+    // R2: 计算一次，复用于状态栏与历史；底栏是**当前模型**口径
+    ctx.ui.setStatus(
+      "cache",
+      `cache ${calcHitRate(bucket.cacheRead, bucket.input).toFixed(1)}% · ${bucket.turns}t`,
+    );
 
+    // 趋势图保持全部模型累计口径（与底栏的单模型口径不同，标题已标注）
+    const totals = sumStats(buckets.values());
     // R3: 用 toFixed(1) 做定点比较，避免浮点去重失效
-    const rateKey = rate.toFixed(1);
+    const rateKey = calcHitRate(totals.cacheRead, totals.input).toFixed(1);
     const lastKey = lastHitRate.toFixed(1);
     if (rateKey !== lastKey) {
       // R4: 截断内存数组，与落盘保持一致
-      hitRateHistory.push({ turn: turns, hitRate: rate, timestamp: Date.now() });
+      hitRateHistory.push({ turn: totals.turns, hitRate: Number(rateKey), timestamp: Date.now() });
       if (hitRateHistory.length > MAX_HISTORY_POINTS) {
         hitRateHistory.splice(0, hitRateHistory.length - MAX_HISTORY_POINTS);
       }
-      lastHitRate = rate;
+      lastHitRate = Number(rateKey);
       scheduleSaveHistory(hitRateHistory);
     }
   });
 
+  /**
+   * 取当前模型的目录 cost：优先 `registry.find(provider, id)`；退回宿主当前模型
+   * （虚拟模型 / 路由模型下 provider+id 未必能在目录里命中）。
+   */
+  const resolveActiveCost = (ctx: ExtensionContext, ref: ModelRef | undefined) => {
+    if (!ref?.id) return undefined;
+    try {
+      const found = ref.provider ? ctx.modelRegistry.find(ref.provider, ref.id) : undefined;
+      if (found) return found.cost;
+    } catch {
+      // 目录查询失败不影响统计展示：退回当前模型 / 保守下界
+    }
+    const current = ctx.model;
+    if (current && (current.id === ref.id || current.provider === ref.provider))
+      return current.cost;
+    return undefined;
+  };
+
   // /cache-stats → overlay 弹窗
-  const buildStatsView = (): StatsView => {
+  const buildStatsView = (ctx: ExtensionContext): StatsView => {
     const now = new Date();
+    const byModel = [...buckets.values()].sort(
+      (a, b) => b.cacheRead + b.input - (a.cacheRead + a.input) || (a.key < b.key ? -1 : 1),
+    );
+    // 还没发过消息就打开弹窗时（如会话刚启动）退化为量最大的桶，让弹窗仍有意义
+    const active =
+      (activeRef ? buckets.get(bucketKey(activeRef.provider, activeRef.id)) : undefined) ??
+      byModel[0];
+    const ref: ModelRef | undefined = active
+      ? { provider: active.provider, id: active.id }
+      : undefined;
+    const totals = sumStats(buckets.values());
     return {
-      stats: { cacheRead, input, cacheWrite, turns },
+      stats: active ?? { cacheRead: 0, input: 0, cacheWrite: 0, turns: 0 },
+      ref,
+      modelLabel: modelLabelOf(ref?.provider, ref?.id),
+      totals,
+      totalsHitRate: calcHitRate(totals.cacheRead, totals.input),
+      byModel,
       lastTurnHitRate: lastTurn ? calcHitRate(lastTurn.read, lastTurn.miss) : undefined,
-      model: activeModel,
-      pricing: currentPricing(activeModel, now),
-      peak: isPeakWindow(now),
-      reportsCacheWrite,
+      pricing: resolvePricing(ref, resolveActiveCost(ctx, ref), now),
+      reportsCacheWrite: active?.cacheWriteReported === true,
     };
   };
 
@@ -798,7 +1169,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       setExtensionCtx(ctx);
       await ctx.ui.custom<void>(
-        (_tui, theme, _kb, done) => new CacheStatsOverlay(theme, buildStatsView(), done),
+        (_tui, theme, _kb, done) => new CacheStatsOverlay(theme, buildStatsView(ctx), done),
         { overlay: true },
       );
     },
@@ -823,15 +1194,11 @@ export default function (pi: ExtensionAPI) {
       setExtensionCtx(ctx);
       // 二次确认
       await ctx.ui.notify(strings.resetDone, "info");
-      cacheRead = 0;
-      input = 0;
-      cacheWrite = 0;
-      turns = 0;
+      buckets.clear();
       hitRateHistory.length = 0;
       lastHitRate = 0;
       lastTurn = undefined;
-      activeModel = undefined;
-      reportsCacheWrite = false;
+      activeRef = undefined;
       knownPrefixes.length = 0;
       prefixBreaks = 0;
       summaryCache.clear();
@@ -932,14 +1299,19 @@ export default function (pi: ExtensionAPI) {
       : history;
 
     const key = createHash("sha256").update(text).digest("hex");
-    let summary = summaryCache.get(key);
-    let summarizer = "deepseek-flash";
-    if (!summary) {
-      const fresh = await summarizeWithFlash(text, ctx, signal);
+    const cached = summaryCache.get(key);
+    let summary: string;
+    let summarizer: string;
+    if (cached) {
+      // v0.5: 缓存值自带产出模型名，`details.summarizer` 不再靠猜
+      summary = cached.summary;
+      summarizer = cached.model;
+    } else {
+      const fresh = await summarizeWithModel(text, ctx, signal);
       if (!fresh) return;
       summary = fresh.summary;
       summarizer = fresh.model;
-      setSummaryCache(summaryCache, key, summary);
+      setSummaryCache(summaryCache, key, { summary, model: summarizer });
       saveSummaryCache(summaryCache); // R12: 新摘要落盘，跨会话复用
     }
 
@@ -974,32 +1346,76 @@ export default function (pi: ExtensionAPI) {
  * 与 pi 自身的 getSummarizationFailure 同语义（未从包根导出，故内联）：
  * "A length stop contains partial text and must not become a session checkpoint."
  * error / length 两种 stopReason 都代表摘要不完整，不能被当作检查点。
+ *
+ * 只返回失败原因（模型 id 由调用处拼上），避免与 `strings.summaryFailed` 重复叙述。
  */
-function getSummarizationFailure(
-  response: { stopReason?: string; errorMessage?: string },
-  label: string,
-): string | undefined {
+function getSummarizationFailure(response: {
+  stopReason?: string;
+  errorMessage?: string;
+}): string | undefined {
   if (response.stopReason === "error") {
-    return `${label} 失败：${response.errorMessage || "未知错误"}`;
+    return response.errorMessage || strings.summaryUnknownError;
   }
   if (response.stopReason === "length") {
-    return `${label} 失败：生成触达 token 上限，摘要不完整`;
+    return strings.summaryTruncated;
   }
   return undefined;
 }
 
-async function summarizeWithFlash(
+/** 摘要器模型（结构类型，避免为类型而引入 @earendil-works/pi-ai） */
+type SummarizerModel = NonNullable<ExtensionContext["model"]>;
+
+/**
+ * 选摘要模型。v0.5 起不再假设官方 provider 存在——第三方部署（router / 自建
+ * OpenAI 兼容端点）下 `find("deepseek", ...)` 永远落空，旧实现在这类环境里
+ * 等于没有 P3（每次都 notify 回退）。
+ *
+ * 顺序：
+ * 1. 官方 provider 上的候选名（`deepseek-flash` / legacy `deepseek-v4-flash`）：官方用户行为不变；
+ * 2. 当前模型本身就是 `flash` 档：直接用（用户已在用、已验证可用，不做意外路由）；
+ * 3. 当前 provider 的 `flash` 档（优先名字含 `deepseek`，多候选取字典序最小以保证跨轮稳定）：
+ *    第三方 router 常有多个后端的同款 flash（如 `amd/DeepSeek-V4.1-Flash`）；
+ * 4. 当前模型；
+ * 5. 都没有 → 调用处 notify 并回退默认 compaction。
+ */
+function resolveSummarizerModel(ctx: ExtensionContext): SummarizerModel | undefined {
+  // 官方注(1)：`deepseek-flash` 为当前模型名，legacy 名 `deepseek-v4-flash` 仍受理。
+  // 两个名字都试，任一命中即可，避免 pi 模型目录跟进官方改名后静默失效。
+  for (const id of SUMMARIZER_CANDIDATES) {
+    const model = ctx.modelRegistry.find(OFFICIAL_DEEPSEEK_PROVIDER, id);
+    if (model) return model;
+  }
+
+  const current = ctx.model;
+  if (current) {
+    if (current.id.toLowerCase().includes("flash")) return current;
+    if (current.provider) {
+      try {
+        const flash = ctx.modelRegistry
+          .getModelsOfType("chat", current.provider)
+          .filter((m) => m.id.toLowerCase().includes("flash"));
+        if (flash.length > 0) {
+          const preferred = flash.find((m) => m.id.toLowerCase().includes("deepseek"));
+          // 多候选时取字典序最小，避免目录顺序抖动导致每次选到不同模型
+          return (
+            preferred ?? [...flash].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
+          );
+        }
+      } catch {
+        // 目录查询失败不阻断：退回当前模型
+      }
+    }
+  }
+
+  return current;
+}
+
+async function summarizeWithModel(
   text: string,
   ctx: ExtensionContext,
   signal: AbortSignal,
 ): Promise<{ summary: string; model: string } | undefined> {
-  // 官方注(1)：`deepseek-flash` 为当前模型名，legacy 名 `deepseek-v4-flash` 仍受理但
-  // 模型已退役。两个名字都试，任一命中即可，避免 pi 模型目录跟进官方改名后静默失效。
-  let model;
-  for (const id of SUMMARIZER_CANDIDATES) {
-    model = ctx.modelRegistry.find("deepseek", id);
-    if (model) break;
-  }
+  const model = resolveSummarizerModel(ctx);
   if (!model) {
     ctx.ui.notify(strings.modelMissing(SUMMARIZER_CANDIDATES.join(" / ")), "warning");
     return;
@@ -1007,7 +1423,7 @@ async function summarizeWithFlash(
 
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) {
-    ctx.ui.notify(strings.authFailed(auth.error), "warning");
+    ctx.ui.notify(strings.authFailed(model.id, auth.error), "warning");
     return;
   }
 
@@ -1039,9 +1455,9 @@ async function summarizeWithFlash(
     // and must not become a session checkpoint."）。该函数未从包根导出，故在此内联。
     // 重要：本扩展返回的摘要会被 pi 原文替换历史，并按输入哈希写进 summary-cache.json，
     // 因此一次截断不但丢上下文，还会被缓存固化。
-    const failure = getSummarizationFailure(response, "flash 摘要");
+    const failure = getSummarizationFailure(response);
     if (failure) {
-      ctx.ui.notify(strings.summaryFailed(failure), "warning");
+      ctx.ui.notify(strings.summaryFailed(`${model.id}: ${failure}`), "warning");
       return;
     }
 

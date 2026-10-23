@@ -23,8 +23,13 @@ const GRAPH_OVERLAY_WIDTH = 60;
 const CHART_HEIGHT = 10;
 const CHART_MAX_WIDTH = 48;
 const MAX_HISTORY_POINTS = 100;
-const SUMMARY_MAX_TOKENS = 8192;
 const FLAT_CHART_EPSILON = 0.05;
+/**
+ * 续命否决门槛：连续这么多轮都没有任何 cache read，说明这个模型/部署的前缀缓存
+ * 根本没在服务我们（自建实例按副本缓存、router 轮询到别的后端、缓存被关）。
+ * 此时 pi 的续命只会按 cache-read 单价付费而不可能回本。
+ */
+const WARM_MIN_TURNS = 3;
 
 // ───────── R13: 定价（官方 Models & Pricing，每百万 token，美元）─────────
 // Ground Truth: https://api-docs.deepseek.com/quick_start/pricing
@@ -276,6 +281,22 @@ const STRINGS = {
       "Compress the following conversation history into a structured Markdown summary covering: " +
       "goals, key decisions and rationale, code/file changes, current progress, blockers and unresolved questions, and next steps. " +
       "Write the summary in the dominant language of the conversation. Be complete because this summary will replace the original history.\n\n",
+    // 与 pi 1.4.0 内置压缩同措辞（compaction.js: `Additional focus: ${customInstructions}`），
+    // 这样 `/compact <instructions>` 在自定义压缩路径下语义一致。
+    summaryFocus: "Additional focus",
+    warmDescription: "Cache warming (pi native) status for the current model",
+    warmTitle: "⚡ Cache warming (pi native)",
+    warmModel: (label: string) => `Model: ${label}`,
+    warmTtlDeclared: (seconds: number) => `promptCache TTL: ${seconds}s (pi may warm this model)`,
+    warmTtlMissing: "promptCache TTL: not declared → pi never warms this model",
+    warmTelemetry: (rate: string, turns: number) => `Cache hits: ${rate}% over ${turns} turn(s)`,
+    warmNoTelemetry: "Cache hits: no data for this model yet",
+    warmVetoOn:
+      "Extension veto: ON — no cache read in the last few turns, so warming would pay for a cache nothing reuses",
+    warmVetoOff: "Extension veto: off — warming is left to pi's own cost model",
+    warmEnable: "Enable it in ~/.pi/agent/models.json:",
+    warmHint:
+      "DeepSeek clears unused prefixes after hours to days and documents no exact TTL, so a 1h lifetime is the conservative end. Re-run /cache-stats after enabling to confirm hits actually accrue.",
   },
   zh: {
     statsParseFailed: (message: string) =>
@@ -334,6 +355,19 @@ const STRINGS = {
       "①目标 ②关键决策与理由 ③代码/文件改动 ④当前进度 ⑤堵塞与未决问题 ⑥后续步骤。" +
       "用对话的主要语言书写摘要。" +
       "务必完整,因为它将替换这段历史。\n\n",
+    summaryFocus: "额外关注点",
+    warmDescription: "显示当前模型的 pi 原生缓存续命状态",
+    warmTitle: "⚡ 缓存续命（pi 原生）",
+    warmModel: (label: string) => `当前模型 ${label}`,
+    warmTtlDeclared: (seconds: number) => `promptCache 生命期 ${seconds}s（pi 可对该模型续命）`,
+    warmTtlMissing: "promptCache 生命期 未声明 → pi 不会对该模型续命",
+    warmTelemetry: (rate: string, turns: number) => `本模型命中 ${rate}%（${turns} 轮）`,
+    warmNoTelemetry: "本模型暂无命中数据",
+    warmVetoOn: "扩展否决 开启 — 最近数轮无任何 cache read，续命只在为不会被复用的缓存付费",
+    warmVetoOff: "扩展否决 关闭 — 续命交给 pi 自己的成本模型",
+    warmEnable: "在 ~/.pi/agent/models.json 中启用：",
+    warmHint:
+      "DeepSeek 未公布精确 TTL（官方只说“长时间不用的缓存会自动清空”，社区实测为数小时至数日），故 1h 取保守端。启用后请用 /cache-stats 确认命中真的在增长。",
   },
 } as const;
 
@@ -1290,13 +1324,19 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_compact", async (event, ctx) => {
     setExtensionCtx(ctx);
     flushPendingWrites(); // R8: compaction 前强制 flush，避免丢失未写数据
-    const { preparation, signal } = event;
+    const { preparation, signal, customInstructions, reason } = event;
     const { messagesToSummarize, firstKeptEntryId, tokensBefore, previousSummary } = preparation;
 
     const history = serializeConversation(convertToLlm(messagesToSummarize));
-    const text = previousSummary
+    const base = previousSummary
       ? `${strings.previousSummary}\n${previousSummary}\n\n${strings.newHistory}\n${history}`
       : history;
+
+    // pi 1.4.0 起 `/compact <指令>` 通过 `event.customInstructions` 传入（#11058）。
+    // 自定义压缩接管了压缩路径，不自己带上就等于把用户指令静默丢掉；指令还必须并入
+    // 哈希键，否则同一段历史换一条指令会命中上一次的摘要。措辞与宿主内置压缩一致。
+    const focus = customInstructions?.trim();
+    const text = focus ? `${base}\n\n${strings.summaryFocus}: ${focus}` : base;
 
     const key = createHash("sha256").update(text).digest("hex");
     const cached = summaryCache.get(key);
@@ -1320,9 +1360,60 @@ export default function (pi: ExtensionAPI) {
         summary,
         firstKeptEntryId,
         tokensBefore,
-        details: { summarizer },
+        // reason（manual / threshold / overflow）写进 details，方便事后区分
+        // “用户手动压”与“撑爆上下文才压”两种检查点。
+        details: { summarizer, ...(reason ? { reason } : {}) },
       },
     };
+  });
+
+  // ──────── P4 对齐 pi 原生缓存续命（cache_warming_decision）────────
+  // pi 0.86.0 起自带成本感知的前缀缓存续命，但它只在模型声明了 `promptCache` 生命期时
+  // 才运行，而 pi 内置目录里的 deepseek 模型没有声明 —— 对 DeepSeek 等于永久关闭。
+  // 本扩展不重复实现续命，只补两件事：把 DeepSeek 的事实说清楚（/cache-warm 给出
+  // models.json 片段），以及在“缓存明显没在服务我们”时否决，避免白付费。
+  pi.on("cache_warming_decision", (_event, ctx) => {
+    setExtensionCtx(ctx);
+    const model = ctx.model;
+    if (!model) return undefined;
+    const bucket = buckets.get(bucketKey(model.provider, model.id));
+    if (!shouldVetoWarming(bucket)) return undefined;
+    return { action: "stop" as const };
+  });
+
+  pi.registerCommand("cache-warm", {
+    description: strings.warmDescription,
+    handler: async (_args, ctx) => {
+      setExtensionCtx(ctx);
+      const model = ctx.model;
+      const ref: ModelRef | undefined = model
+        ? { provider: model.provider, id: model.id }
+        : activeRef;
+      const bucket = ref ? buckets.get(bucketKey(ref.provider, ref.id)) : undefined;
+      const ttl = warmTtlSeconds(model);
+      const rate = bucket ? calcHitRate(bucket.cacheRead, bucket.input).toFixed(1) : undefined;
+      // models.json 的 modelOverrides 以模型 id 为键（不是 provider/id）
+      const snippet = JSON.stringify(
+        { modelOverrides: { [model?.id ?? "deepseek-flash"]: { promptCache: { short: 3600 } } } },
+        null,
+        2,
+      );
+      const lines = [
+        strings.warmTitle,
+        strings.warmModel(modelLabelOf(ref?.provider, ref?.id)),
+        ttl === undefined ? strings.warmTtlMissing : strings.warmTtlDeclared(ttl),
+        bucket && rate !== undefined
+          ? strings.warmTelemetry(rate, bucket.turns)
+          : strings.warmNoTelemetry,
+        shouldVetoWarming(bucket) ? strings.warmVetoOn : strings.warmVetoOff,
+        "",
+        strings.warmEnable,
+        snippet,
+        "",
+        strings.warmHint,
+      ];
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
   });
 
   // 会话生命周期：切换/新会话时重置前缀指纹，避免旧会话哈希残留导致跨会话假阳性告警；
@@ -1360,6 +1451,28 @@ function getSummarizationFailure(response: {
     return strings.summaryTruncated;
   }
   return undefined;
+}
+
+/** 续命资格只依赖 promptCache 的两档生命期（宿主 Model 类型的结构子集） */
+type WarmableModel = { promptCache?: { short?: number; long?: number } };
+
+/** pi 只对声明了 promptCache 生命期的模型续命；未声明时事件根本不会触发。 */
+export function warmTtlSeconds(model: WarmableModel | undefined): number | undefined {
+  return model?.promptCache?.short ?? model?.promptCache?.long;
+}
+
+/**
+ * 是否否决本轮续命。
+ *
+ * 只在“前缀缓存根本没在服务我们”时否决：连续 WARM_MIN_TURNS 轮没有任何 cache read。
+ * 自建实例按副本缓存、router 轮询到别的副本、缓存被关掉，都属于这类；此时续命每次
+ * 都要按 cache-read 单价付费，却不可能换来命中。否决只影响本轮（pi 的 "stop" 到
+ * 下一次真实请求为止），不会永久关掉续命。
+ */
+export function shouldVetoWarming(
+  bucket: { turns: number; cacheRead: number } | undefined,
+): boolean {
+  return bucket !== undefined && bucket.turns >= WARM_MIN_TURNS && bucket.cacheRead === 0;
 }
 
 /** 摘要器模型（结构类型，避免为类型而引入 @earendil-works/pi-ai） */
@@ -1447,7 +1560,10 @@ async function summarizeWithModel(
           },
         ],
       },
-      { maxTokens: SUMMARY_MAX_TOKENS, temperature: 0, signal },
+      // pi 1.4.0 起内置摘要不再传 maxTokens，改为吃模型输出上限，以修 #9512 的
+      // “generation hit the token cap”（`reserveTokens` 也已被忽略）。这里对齐宿主：
+      // 不设上限；同时 `cacheRetention: "none"` —— 一次性摘要不该写缓存，宿主同样如此。
+      { temperature: 0, signal, cacheRetention: "none" as const },
     );
 
     // 截断/失败的摘要不得成为会话检查点。与 pi 自身的 getSummarizationFailure 同语义

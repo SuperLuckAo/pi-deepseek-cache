@@ -29,7 +29,7 @@ const asApi = (api: ReturnType<typeof createMockExtensionAPI>) => api as unknown
 type CompletionResult = { content: Array<{ type: string; text?: string }> };
 const completion = (text: string): CompletionResult => ({ content: [{ type: "text", text }] });
 
-import index, { resolveLanguage } from "../index.js";
+import index, { resolveLanguage, shouldVetoWarming, warmTtlSeconds } from "../index.js";
 
 describe("language selection", () => {
   it("defaults to English for non-Chinese locales", () => {
@@ -73,7 +73,14 @@ const mockCtx = {
     custom: vi.fn().mockResolvedValue(undefined),
   },
   // 宿主当前模型（虚拟模型 / 路由模型下用于回退取价与选摘要器）
-  model: undefined as { id: string; provider: string; cost?: Record<string, number> } | undefined,
+  model: undefined as
+    | {
+        id: string;
+        provider: string;
+        cost?: Record<string, number>;
+        promptCache?: { short?: number; long?: number };
+      }
+    | undefined,
   modelRegistry: {
     find: vi.fn(),
     getModelsOfType: vi.fn(() => [] as Array<{ id: string; provider: string }>),
@@ -1158,5 +1165,177 @@ describe("R17: 摘要器模型解析", () => {
     expect(second.compaction.summary).toBe("cached-summary");
     expect(second.compaction.details.summarizer).toBe(first.compaction.details.summarizer);
     expect(completeMock).not.toHaveBeenCalled();
+  });
+});
+
+// ═══ R18: 对齐 pi 1.4.0 压缩与续命契约 ═══
+describe("R18: pi 1.4.0 compaction & warming parity", () => {
+  let api: ReturnType<typeof createMockExtensionAPI>;
+  let handler: Listener;
+
+  beforeEach(() => {
+    clearPersistedData();
+    resetMockCtx();
+    mockCtx.ui.notify.mockClear();
+    mockCtx.modelRegistry.find.mockReturnValue({ id: "deepseek-flash", provider: "deepseek" });
+    mockCtx.modelRegistry.getApiKeyAndHeaders.mockResolvedValue({
+      ok: true,
+      apiKey: "sk-test",
+      headers: {},
+    });
+    completeMock.mockReset();
+    api = createMockExtensionAPI();
+    index(asApi(api));
+    handler = listenerFor(api, "session_before_compact");
+  });
+
+  /** 触发一次压缩；`event` 追加 /compact 指令、reason 等新字段 */
+  const runCompact = (event: Record<string, unknown> = {}) =>
+    handler(
+      {
+        preparation: {
+          messagesToSummarize: [{ role: "user", content: "hi" }],
+          firstKeptEntryId: "e1",
+          tokensBefore: 10,
+          previousSummary: "",
+        },
+        signal: new AbortController().signal,
+        ...event,
+      },
+      mockCtx,
+    ) as Promise<{ compaction: { summary: string; details: Record<string, unknown> } }>;
+
+  it("/compact <指令> 进入摘要 prompt，并计入缓存键（换指令不命中旧摘要）", async () => {
+    completeMock.mockResolvedValueOnce(completion("s-focus-a"));
+    expect((await runCompact({ customInstructions: "只看部署步骤" })).compaction.summary).toBe(
+      "s-focus-a",
+    );
+    const prompt = (completeMock.mock.calls[0][1] as any).messages[0].content[0].text as string;
+    expect(prompt).toContain("只看部署步骤");
+
+    // 同一段历史换一条指令 → 必须重新摘要，不能命中上一次的结果
+    completeMock.mockResolvedValueOnce(completion("s-focus-b"));
+    expect((await runCompact({ customInstructions: "只看回滚方案" })).compaction.summary).toBe(
+      "s-focus-b",
+    );
+    expect(completeMock).toHaveBeenCalledTimes(2);
+
+    // 同指令同历史 → 命中摘要缓存
+    completeMock.mockClear();
+    expect((await runCompact({ customInstructions: "只看回滚方案" })).compaction.summary).toBe(
+      "s-focus-b",
+    );
+    expect(completeMock).not.toHaveBeenCalled();
+  });
+
+  it("空白指令不改变 prompt（v0.5 的缓存键保持有效）", async () => {
+    completeMock.mockResolvedValueOnce(completion("s-plain"));
+    await runCompact();
+    completeMock.mockClear();
+    completeMock.mockResolvedValueOnce(completion("unused"));
+    expect((await runCompact({ customInstructions: "   " })).compaction.summary).toBe("s-plain");
+    expect(completeMock).not.toHaveBeenCalled();
+  });
+
+  it("reason 写进 details，区分手动/超额/溢出压缩", async () => {
+    completeMock.mockResolvedValueOnce(completion("s-reason"));
+    expect((await runCompact({ reason: "overflow" })).compaction.details.reason).toBe("overflow");
+  });
+
+  it("摘要请求对齐宿主：不设 maxTokens、cacheRetention 为 none", async () => {
+    completeMock.mockResolvedValueOnce(completion("s-opts"));
+    await runCompact();
+    const options = completeMock.mock.calls[0][2] as Record<string, unknown>;
+    // pi 1.4.0 用模型输出上限（不传 maxTokens），并要求一次性摘要不写缓存
+    expect(options.maxTokens).toBeUndefined();
+    expect(options.cacheRetention).toBe("none");
+  });
+
+  it("cache_warming_decision：连续多轮零命中时否决本轮续命", async () => {
+    mkdirSync(STATS_DIR, { recursive: true });
+    writeFileSync(
+      join(STATS_DIR, "stats.json"),
+      JSON.stringify({
+        version: 2,
+        byModel: [
+          {
+            key: "deepseek/deepseek-flash",
+            provider: "deepseek",
+            id: "deepseek-flash",
+            cacheRead: 0,
+            input: 900,
+            cacheWrite: 0,
+            turns: 4,
+          },
+        ],
+      }),
+    );
+    const vetoApi = createMockExtensionAPI();
+    index(asApi(vetoApi));
+    mockCtx.model = { id: "deepseek-flash", provider: "deepseek" };
+    const decide = listenerFor(vetoApi, "cache_warming_decision");
+    expect(await decide({ type: "cache_warming_decision", action: "warm" }, mockCtx)).toEqual({
+      action: "stop",
+    });
+  });
+
+  it("cache_warming_decision：有命中记录时不干预 pi 的成本模型", async () => {
+    mkdirSync(STATS_DIR, { recursive: true });
+    writeFileSync(
+      join(STATS_DIR, "stats.json"),
+      JSON.stringify({
+        version: 2,
+        byModel: [
+          {
+            key: "deepseek/deepseek-flash",
+            provider: "deepseek",
+            id: "deepseek-flash",
+            cacheRead: 800,
+            input: 200,
+            cacheWrite: 0,
+            turns: 4,
+          },
+        ],
+      }),
+    );
+    const passApi = createMockExtensionAPI();
+    index(asApi(passApi));
+    mockCtx.model = { id: "deepseek-flash", provider: "deepseek" };
+    const decide = listenerFor(passApi, "cache_warming_decision");
+    expect(
+      await decide({ type: "cache_warming_decision", action: "warm" }, mockCtx),
+    ).toBeUndefined();
+  });
+
+  it("/cache-warm：模型未声明 TTL 时给出 models.json 片段", async () => {
+    mockCtx.model = { id: "deepseek-flash", provider: "deepseek" };
+    await api.__getCommand("cache-warm")!.handler([], mockCtx);
+    const text = mockCtx.ui.notify.mock.calls.at(-1)![0] as string;
+    expect(text).toContain("promptCache");
+    expect(text).toContain('"deepseek-flash"');
+    expect(text).toContain("3600");
+  });
+
+  it("/cache-warm：已声明 TTL 时报出生效的生命期", async () => {
+    mockCtx.model = { id: "deepseek-flash", provider: "deepseek", promptCache: { short: 900 } };
+    await api.__getCommand("cache-warm")!.handler([], mockCtx);
+    const text = mockCtx.ui.notify.mock.calls.at(-1)![0] as string;
+    expect(text).toContain("900s");
+  });
+});
+
+describe("R18: warming helpers", () => {
+  it("warmTtlSeconds 优先 short，其次 long，未声明为 undefined", () => {
+    expect(warmTtlSeconds({ promptCache: { short: 300, long: 3600 } })).toBe(300);
+    expect(warmTtlSeconds({ promptCache: { long: 3600 } })).toBe(3600);
+    expect(warmTtlSeconds({})).toBeUndefined();
+    expect(warmTtlSeconds(undefined)).toBeUndefined();
+  });
+
+  it("shouldVetoWarming 只在前缀缓存从未命中且轮次足够时成立", () => {
+    expect(shouldVetoWarming(undefined)).toBe(false);
+    expect(shouldVetoWarming({ turns: 2, cacheRead: 0 })).toBe(false);
+    expect(shouldVetoWarming({ turns: 3, cacheRead: 0 })).toBe(true);
+    expect(shouldVetoWarming({ turns: 9, cacheRead: 1 })).toBe(false);
   });
 });

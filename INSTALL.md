@@ -173,6 +173,29 @@ pi
 # 进行多轮对话，观察状态栏的缓存命中率
 ```
 
+### （可选）启用 pi 原生缓存续命
+
+pi 自带成本感知的前缀缓存续命（刷新 = 重放原请求 + 1 个输出 token），但它**只对声明了缓存生命期的模型运行**，而内置 deepseek 目录没有声明 —— 对 DeepSeek 默认是关闭的。
+
+```bash
+# 先看当前模型的资格、命中数据、否决状态，以及现成片段
+/cache-warm
+```
+
+把打印出的片段写进 `~/.pi/agent/models.json`（`modelOverrides` 的键是模型 id，不含 provider）：
+
+```json
+{
+  "modelOverrides": {
+    "deepseek-flash": { "promptCache": { "short": 3600 } }
+  }
+}
+```
+
+`3600` 是保守端：官方只说“长时间不用的缓存会自动清空”，未公布精确 TTL（社区实测数小时至数日）。启用后跑几轮真实对话，再用 `/cache-stats` 确认命中真的在增长；如果这个部署的缓存根本不复用（自建副本 / router 扇出），扩展会在连续数轮零命中后自动否决续命，不会一直付费。
+
+> 续命开关本身是 pi 的设置：`cacheWarming: "off" | "streaming" | "idle"`，默认 `streaming`。
+
 ## 卸载扩展
 
 ### 使用 `pi remove` 命令

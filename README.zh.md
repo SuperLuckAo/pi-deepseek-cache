@@ -38,7 +38,8 @@ DeepSeek API 内置了**磁盘上下文缓存**：任何提示**前缀**与已�
 - **实时状态栏** — 每条消息后在 Pi 底栏显示***当前模型***的累计命中率与轮次
 - **ASCII 趋势图** — 使用 `/cache-graph` 可视化**全部模型累计**口径的命中率趋势（平坦率特判 + 定点标签）
 - **成本节省估算** — 按**模型目录**（`models.json` / pi 内置目录）里当前模型的 `cost` 计价 —— 这才是官方与第三方部署都成立的真源。只有 provider 是官方 `deepseek` 时才额外套用官方 [Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing) 价目表与 peak/off-peak 时段；目录里零价的模型显示 `—` 而不是编一个数字。`/cache-stats` 同时展示累计/本轮命中率、所用模型、**单价来源**、单价，以及按模型的明细
-- **缓存友好的 compaction** — 存在官方 `deepseek-flash`（legacy 名 `deepseek-v4-flash` 回退）时优先用它；否则当前模型本身已是 `flash` 档时直接用当前模型；否则用**当前 provider** 的 `flash` 档模型；再否则用当前模型。统一 temperature 0；结果按 SHA-256 缓存并跨会话复用（LRU 上限 64）。注意：这是**独立冷调用**，**并非**对路由请求的 verbatim 回放 —— 详见 [§7.4](./docs/prefix-cache-principle.md)
+- **缓存友好的 compaction** — 存在官方 `deepseek-flash`（legacy 名 `deepseek-v4-flash` 回退）时优先用它；否则当前模型本身已是 `flash` 档时直接用当前模型；否则用**当前 provider** 的 `flash` 档模型；再否则用当前模型。统一 temperature 0；结果按 SHA-256 缓存并跨会话复用（LRU 上限 64）。已对齐 pi 1.4.0：`/compact <指令>` 会作为 `Additional focus` 带进摘要 prompt 并计入缓存键；不再传 `maxTokens`（吃模型输出上限）；一次性摘要请求 `cacheRetention: none`。注意：这是**独立冷调用**，**并非**对路由请求的 verbatim 回放 —— 详见 [§7.4](./docs/prefix-cache-principle.md)
+- **缓存续命桥接** — pi 原生的成本感知续命（`cacheWarming` / `cache_warming_decision`）对 DeepSeek 默认永久关闭：内置目录里的 deepseek 模型没有声明 `promptCache` 生命期。`/cache-warm` 报出当前模型的续命资格，并直接给出让它生效的 `models.json` 片段；同时当某模型连续数轮没有任何 cache read（自建副本、router 扇出、缓存被关）时，扩展会**否决**本轮续命，避免为不会被复用的缓存付费
 - **原子持久化** — `tmp + rename` 原子写入 + 防抖异步落盘 + `session_start`/`session_shutdown` 生命周期保障，无撕裂 JSON
 - **`/cache-reset`** — 一条命令清空所有统计、历史和摘要缓存
 
@@ -119,6 +120,7 @@ pi --model my-router/deepseek-v4.1-flash
 | -------------- | --------------------------------------------------------------------------- |
 | `/cache-stats` | 弹窗显示命中率、缓存命中/未命中 token、轮次、预估节省、单价来源与按模型明细 |
 | `/cache-graph` | 弹窗显示**全部模型累计**口径的缓存命中率 ASCII 趋势图                       |
+| `/cache-warm`  | 当前模型的缓存续命资格，并给出让它生效的 `models.json` 片段                |
 | `/cache-reset` | 重置所有统计、历史和摘要缓存（同时清除内存和磁盘）                          |
 
 ## 🔍 工作原理
@@ -127,7 +129,8 @@ pi --model my-router/deepseek-v4.1-flash
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **P1 — 遥测**       | 在 `message_end` 事件中**按模型**（provider + id）累计 `cacheRead` / `input` / `cacheWrite` / `turns`，原子持久化到 `~/.pi/agent/extensions/deepseek-cache/stats.json`（可用 `PI_DEEPSEEK_CACHE_DIR` 改目录）；节省额按模型目录计价，仅官方 `deepseek` provider 额外套用官方价目表 + 峰谷时段 | `TokenUsage` DISJOINT（`translate.ts:mapUsage`）—— `input = prompt_tokens - cacheRead`                                                                                                                |
 | **P2 — 前缀守卫**   | 在 `context` 中过滤 `volatile-scratch`；在 `before_provider_request` 中按字典序排序 `tools`；对 `system` + `tools` + `messages` 三段做稳定 JSON 指纹，与有界的已知前缀集合做包含检测                                                                                                          | `orderTools` / `sameSchema` / `canonicalHeader` / `headerEquals`（`packages/core/system-prompt`、`packages/core/session`）                                                                            |
-| **P3 — Compaction** | 在 `session_before_compact` 时将历史序列化为单条 user 消息，temperature 0 做摘要：优先官方 `deepseek-flash`（legacy 名回退），否则当前 provider 的 `flash` 档，再否则当前模型；SHA-256 缓存（LRU 64）并原子持久化                                                                             | **无 parity** —— Harness `compaction-basic/summarizer.ts` 会回放 `system+tools+shadowed messages` + 尾部指令以复用 warm 前缀；本路径是独立冷调用，取舍理由见 [§7.4](./docs/prefix-cache-principle.md) |
+| **P3 — Compaction** | 在 `session_before_compact` 时将历史序列化为单条 user 消息，temperature 0 做摘要：优先官方 `deepseek-flash`（legacy 名回退），否则当前 provider 的 `flash` 档，再否则当前模型；`/compact <指令>` 作为 `Additional focus` 传递、不传 `maxTokens`、一次性摘要 `cacheRetention: none`；SHA-256 缓存（LRU 64）并原子持久化                                                                             | **无 parity** —— Harness `compaction-basic/summarizer.ts` 会回放 `system+tools+shadowed messages` + 尾部指令以复用 warm 前缀；本路径是独立冷调用，取舍理由见 [§7.4](./docs/prefix-cache-principle.md) |
+| **P4 — 续命**       | 续命本身交给 pi（`cacheWarming`，刷新成本 = 一次 cache read + 1 个输出 token，且仅当模型声明了 `promptCache` 才运行）；当某模型在 `turns >= 3` 内没有任何 cache read（前缀缓存明显没在服务该部署）时，把 `cache_warming_decision` 覆写为 `stop` | pi `cache-warmer.ts` —— 成本感知裁决，扩展可改 `action`，改失败自动回落到 pi 自己的判断 |
 
 > 📖 深入原理：[前缀缓存原理](./docs/prefix-cache-principle.md) —— 官方 [Context Caching on Disk](https://api-docs.deepseek.com/guides/kv_cache)（基于 SWA 的独立 cache prefix unit、3 种落盘时机、best-effort）+ Harness 五重强制 + Pi 映射
 
@@ -138,11 +141,12 @@ pi --model my-router/deepseek-v4.1-flash
 - **底栏无显示** → 确认已选择服务 DeepSeek 的模型，且其 provider 凭据可用。
 - **第三方端点上命中率恒为 0%** → 该端点不在 `usage` 里上报命中 token，扩展无从测量。去查原始响应，不要怀疑扩展。
 - **预估节省显示 `—`** → 模型在目录里没有可用的 `cost.input`（免费 / 未标价）。给 `models.json` 里对应模型补上 `cost` 才会有数字。
+- **`/cache-warm` 说没有声明生命期** → pi 无法为未声明 `promptCache` 的模型续命，而内置 deepseek 目录一条都没声明。把命令给出的 `models.json` 片段复制过去即可（`short: 3600` 取保守端：官方只说“长时间不用的缓存会自动清空”，社区实测为数小时至数日），随后用 `/cache-stats` 确认命中真的在增长。
 
 ## 🧪 测试
 
 ```bash
-npm test              # 80 个测试（70 单元 + 10 集成）
+npm test              # 90 个测试（80 单元 + 10 集成）
 ```
 
 ## 🤝 贡献

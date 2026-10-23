@@ -570,6 +570,26 @@ pi.on("session_before_compact", async (event, ctx) => {
 | 目录零价（免费 / 未标价模型）时不估算节省，显示 `—`（v0.5）                                                                                                | index.ts `PricingResolution.available`        |
 | 官方 usage 无 cache write 字段，未观测到非零写入时隐藏「缓存写入」行（避免恒为 0 的死 UI）                                                                 | index.ts `reportsCacheWrite`                  |
 
+### 7.4 Compaction 取舍（P3）与原生续命对齐（P4）
+
+**P3 为什么不是 verbatim 回放。** 宿主 compaction 的输入是「被替换掉的历史」，与下一次真实请求的前缀不重合；要复用 warm 前缀就得连 `system + tools + shadowed messages` 一起回放（Harness `compaction-basic/summarizer.ts` 的做法），代价是摘要请求本身变大、且摘要器一旦不是同一路由就前功尽弃。本项目改用「一次性冷调用 + SHA-256 摘要缓存」：命中缓存时零请求，未命中时也不指望命中前缀。这一取舍自 v0.3 起未变。
+
+**与 pi 1.4.0 的对齐点**（宿主契约变了，自定义压缩必须自己跟上，否则是静默行为差异）：
+
+| 宿主契约                                            | 本项目做法                                                                 | 不跟上的后果                                          |
+| --------------------------------------------------- | -------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `/compact <指令>` 经 `event.customInstructions` 传入（pi 1.4.0 #11058） | 以 `Additional focus: ...` 并入摘要 prompt，**并计入摘要缓存键**            | 用户的定向压缩指令被静默丢弃；换指令还会命中旧摘要    |
+| 摘要不再设 `maxTokens`，改用模型输出上限（pi 1.4.0 #9512） | 不传 `maxTokens`                                                           | 长 reasoning 摘要仍会 `stopReason: "length"`，而截断摘要会被拒收 |
+| 一次性摘要请求 `cacheRetention: none`               | 同样传 `none`                                                              | 在按写入计费的 provider 上为一次性摘要白付缓存写入费  |
+| `event.reason`（manual / threshold / overflow）     | 写进 `compaction.details.reason`                                            | 事后无法区分「手动压」与「撑爆才压」的检查点          |
+
+**P4 为什么不自己实现续命。** pi 0.86.0 起自带成本感知续命：刷新 = 重放原请求 + 1 个输出 token，代价是「一次 cache read + 1 token」，并且只在 `expectedSavings ≥ $0.05` 时执行。这套模型对 DeepSeek 同样成立（命中按 cacheRead 计费、无写入费），重复实现没有价值。
+
+**P4 的两个实际问题**：
+
+1. **资格缺失**：pi 只在模型声明了 `promptCache` 生命期时才续命，而内置 deepseek 目录一条都没声明 → 对 DeepSeek 等于永久关闭。官方只说明「长时间不用的缓存会自动清空」（社区实测数小时至数日），所以 `/cache-warm` 给的是保守端 `short: 3600`，并明确要求用 `/cache-stats` 复核。
+2. **否决权**：自建实例常按副本缓存、router 会扇出到不同副本、缓存也可能被关。这类环境下续命每次都要付费却不可能换来命中，因此当某模型在 `turns >= 3` 内没有任何 cache read 时，扩展把 `cache_warming_decision` 覆写为 `stop`（只影响本轮，下一次真实请求会重新裁决）。
+
 ---
 
 ## 8. 参考链接

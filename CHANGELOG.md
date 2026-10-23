@@ -1,5 +1,41 @@
 # pi-deepseek-cache 变更日志
 
+## v0.6.0：对齐 pi 1.4.0（`/compact <指令>`、摘要输出上限、原生缓存续命）
+
+> 起因：宿主 pi 已经从 1.2 走到 1.4.0，而本扩展的开发依赖仍锁在 1.2.0。核心代码在 1.4.0 上仍能加载、80 个测试全绿——本节列的三处**都不报错，只是行为与宿主新契约不一致**。
+
+### 修复
+
+- **`/compact <指令>` 被静默丢弃（严重）**：自定义压缩接管了 `session_before_compact`，但只解构了 `preparation` 与 `signal`。pi 1.4.0 修掉了“`/compact <指令>` 指令被忽略”（#11058），但那修的是内置压缩路径；本扩展现已读取 `event.customInstructions`，以 `Additional focus: ...` 并入摘要 prompt（措辞与宿主 `compaction.js` 一致），**并计入摘要缓存键**——否则同一段历史配不同指令会命中上一次的摘要。无指令时摘要文本逐字节不变，v0.5 已落盘的摘要缓存继续有效。
+- **摘要固定 8192 输出上限（中等）**：pi 1.4.0 把内置摘要改成吃模型输出上限，正是为了修 #9512 的 `generation hit the token cap`（`reserveTokens` 也已被忽略）。本扩展的 P3 仍是固定上限 → 长 reasoning 时同样会撞上限，而截断摘要按设计会被拒收（回退默认 compaction）。现在对齐宿主：**不传 `maxTokens`**。
+- **一次性摘要请求改为 `cacheRetention: "none"`**：与宿主 `completeSummarization` 一致。在按缓存写入计费的 provider 上，一次性摘要不该付写入费。
+- **`event.reason` 写进 `compaction.details.reason`**（`manual` / `threshold` / `overflow`）：事后可区分“手动压”与“撑爆上下文才压”的检查点。
+
+### 新增
+
+- **`/cache-warm`：原生缓存续命对齐（P4）**。pi 0.86.0 起自带成本感知的前缀缓存续命（`cacheWarming` / `cache_warming_decision`），但它**只对声明了 `promptCache` 生命期的模型运行**，而 pi 内置 deepseek 目录一条都没声明 → 对 DeepSeek 等于永久关闭。命令报出当前模型的资格、本模型命中数据、扩展否决状态，并直接给出让它生效的 `models.json` 片段：
+
+  ```json
+  { "modelOverrides": { "deepseek-flash": { "promptCache": { "short": 3600 } } } }
+  ```
+
+  取 3600s 是**保守端**：官方只说“长时间不用的缓存会自动清空 / unused entries are automatically cleared after a period”，未公布精确 TTL；社区实测为数小时至数日。命令里明确要求启用后用 `/cache-stats` 复核命中是否真的在增长。
+- **`cache_warming_decision` 否决权**：自建实例常按副本缓存、router 会扇出到不同副本、缓存也可能被关。这类环境下续命每次都要按 cache-read 单价付费却不可能换来命中，因此当某模型在 `turns >= 3` 内**没有任何 cache read** 时，扩展把本轮裁决覆写为 `stop`（只影响本轮，下一次真实请求会重新裁决）。
+
+### 依赖与工具链
+
+- 开发依赖 `@earendil-works/pi-{coding-agent,ai,tui}` 由 `^1.2.0` 升到 `^1.4.0`，锁文件随之更新——此前 CI 校验的是旧宿主，1.4.0 只在本维护者机器上临时跑过。
+
+### 文档
+
+- README（中英）：新增 P4 与 `/cache-warm`，补充 `/compact <指令>`、无输出上限、`cacheRetention: none` 三项对齐；故障排查新增“`/cache-warm` 说没有声明生命期”。
+- `docs/prefix-cache-principle.md` 新增 §7.4：为什么 P3 不是 verbatim 回放（修掉 README 长期悬空的 §7.4 引用）+ 1.4.0 契约对照表 + P4 的两个实际问题。
+- INSTALL.md 新增安装后的续命配置步骤。
+
+### 测试
+
+- 80 → **90**（80 单元 + 10 集成）。新增 R18：指令进入 prompt 且换指令不命中旧摘要、空白指令保持旧缓存键有效、`reason` 落进 details、摘要请求不带 `maxTokens` 且 `cacheRetention: none`、续命否决/放行、`/cache-warm` 两种 TTL 情形、`warmTtlSeconds` / `shouldVetoWarming` 边界。
+
 ## v0.5.0：让第三方部署真正可用（模型目录计价、按模型分桶、provider 无关的摘要器）
 
 > 起因：本扩展此前的隐含前提是「provider 就是官方 `deepseek`」。这个前提在**第三方部署**——把 DeepSeek 放在 OpenAI 兼容端点后面的 router、自建 vLLM/SGLang、托管服务——上会同时错三处：定价、摘要器、统计口径。三者都是“不报错、但数字／行为静默错”的类型。

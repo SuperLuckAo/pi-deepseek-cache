@@ -576,12 +576,12 @@ pi.on("session_before_compact", async (event, ctx) => {
 
 **与 pi 1.4.0 的对齐点**（宿主契约变了，自定义压缩必须自己跟上，否则是静默行为差异）：
 
-| 宿主契约                                            | 本项目做法                                                                 | 不跟上的后果                                          |
-| --------------------------------------------------- | -------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `/compact <指令>` 经 `event.customInstructions` 传入（pi 1.4.0 #11058） | 以 `Additional focus: ...` 并入摘要 prompt，**并计入摘要缓存键**            | 用户的定向压缩指令被静默丢弃；换指令还会命中旧摘要    |
-| 摘要不再设 `maxTokens`，改用模型输出上限（pi 1.4.0 #9512） | 不传 `maxTokens`                                                           | 长 reasoning 摘要仍会 `stopReason: "length"`，而截断摘要会被拒收 |
-| 一次性摘要请求 `cacheRetention: none`               | 同样传 `none`                                                              | 在按写入计费的 provider 上为一次性摘要白付缓存写入费  |
-| `event.reason`（manual / threshold / overflow）     | 写进 `compaction.details.reason`                                            | 事后无法区分「手动压」与「撑爆才压」的检查点          |
+| 宿主契约                                                                | 本项目做法                                                       | 不跟上的后果                                                     |
+| ----------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `/compact <指令>` 经 `event.customInstructions` 传入（pi 1.4.0 #11058） | 以 `Additional focus: ...` 并入摘要 prompt，**并计入摘要缓存键** | 用户的定向压缩指令被静默丢弃；换指令还会命中旧摘要               |
+| 摘要不再设 `maxTokens`，改用模型输出上限（pi 1.4.0 #9512）              | 不传 `maxTokens`                                                 | 长 reasoning 摘要仍会 `stopReason: "length"`，而截断摘要会被拒收 |
+| 一次性摘要请求 `cacheRetention: none`                                   | 同样传 `none`                                                    | 在按写入计费的 provider 上为一次性摘要白付缓存写入费             |
+| `event.reason`（manual / threshold / overflow）                         | 写进 `compaction.details.reason`                                 | 事后无法区分「手动压」与「撑爆才压」的检查点                     |
 
 **P4 为什么不自己实现续命。** pi 0.86.0 起自带成本感知续命：刷新 = 重放原请求 + 1 个输出 token，代价是「一次 cache read + 1 token」，并且只在 `expectedSavings ≥ $0.05` 时执行。这套模型对 DeepSeek 同样成立（命中按 cacheRead 计费、无写入费），重复实现没有价值。
 

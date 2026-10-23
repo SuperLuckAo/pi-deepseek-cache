@@ -20,6 +20,7 @@
   ```
 
   取 3600s 是**保守端**：官方只说“长时间不用的缓存会自动清空 / unused entries are automatically cleared after a period”，未公布精确 TTL；社区实测为数小时至数日。命令里明确要求启用后用 `/cache-stats` 复核命中是否真的在增长。
+
 - **`cache_warming_decision` 否决权**：自建实例常按副本缓存、router 会扇出到不同副本、缓存也可能被关。这类环境下续命每次都要按 cache-read 单价付费却不可能换来命中，因此当某模型在 `turns >= 3` 内**没有任何 cache read** 时，扩展把本轮裁决覆写为 `stop`（只影响本轮，下一次真实请求会重新裁决）。
 
 ### 依赖与工具链
